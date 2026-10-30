@@ -1,0 +1,15 @@
+{
+  "schema": "ideadock.runtime.v1",
+  "project_id": 2433,
+  "project_slug": "marketplace-bi-dashboard",
+  "namespace": "8uxh4y1ulu",
+  "project": "marketplace-bi-dashboard",
+  "backend_service_id": 62,
+  "service_name": "Marketplace BI API",
+  "route_code": "bs_f190c057",
+  "backend_base_url": "https://vm01-ideadock-runtime.shuidihuzhu.com/_ideadock/bs_f190c057",
+  "run_url": "https://vm01-ideadock-runtime.shuidihuzhu.com/_ideadock/bs_f190c057/",
+  "active_deployment_id": 934,
+  "deployment_status": "healthy",
+  "api_base": "https://ideadock.shuidihuzhu.com"
+}

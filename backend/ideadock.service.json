@@ -1,0 +1,20 @@
+{
+  "schema_version": "2",
+  "runtime": "python",
+  "runtime_version": "3.12",
+  "entry": "app:app",
+  "start": "uvicorn app:app --host 0.0.0.0 --port $PORT",
+  "health_path": "/health",
+  "routes": [
+    {"path": "/health", "methods": ["GET"]},
+    {"path": "/api/platforms", "methods": ["GET"]},
+    {"path": "/api/dashboard", "methods": ["GET"]},
+    {"path": "/api/shopee/auth/start", "methods": ["GET"]},
+    {"path": "/api/shopee/status", "methods": ["GET"]},
+    {"path": "/api/shopee/oauth/callback", "methods": ["GET"]},
+    {"path": "/api/lazada/auth/start", "methods": ["GET"]},
+    {"path": "/api/lazada/status", "methods": ["GET"]},
+    {"path": "/api/lazada/oauth/callback", "methods": ["GET"]}
+  ],
+  "resources": {"cpu": "250m", "memory": "256Mi"}
+}
