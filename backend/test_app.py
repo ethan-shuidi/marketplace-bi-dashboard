@@ -82,10 +82,12 @@ class ShopeeDashboardAggregationTest(unittest.IsolatedAsyncioTestCase):
             {"order_list": [{
                 "order_sn": "A",
                 "create_time": 1792713600,
-                "total_amount": 120,
+                "pay_time": 1792713601,
+                "total_amount": 100,
                 "order_status": "COMPLETED",
-                "item_list": [{"model_quantity_purchased": 3}],
+                "item_list": [{"model_discounted_price": 40.0, "model_quantity_purchased": 3}],
             }]},
+            {"escrow_list": [{"order_sn": "A", "order_income": {"voucher_from_seller": 0}}]},
         ])
         self.adapter._shop_ad_spend = AsyncMock(return_value=(30.0, "ready", {"2026-10-23": 30.0}))
 
@@ -136,10 +138,11 @@ class ShopeeDashboardAggregationTest(unittest.IsolatedAsyncioTestCase):
             {"order_list": [{"order_sn": "B"}], "more": False},
             {"order_list": [
                 {"order_sn": "A", "create_time": 1792713600, "total_amount": 120,
-                 "order_status": "COMPLETED", "item_list": [{"item_quantity": 2}]},
+                 "order_status": "COMPLETED", "item_list": [{"model_discounted_price": 60.0, "model_quantity_purchased": 2}]},
                 {"order_sn": "B", "create_time": 1792713600, "total_amount": 80,
-                 "order_status": "CANCELLED", "item_list": [{"item_quantity": 9}]},
+                 "order_status": "CANCELLED", "item_list": [{"model_discounted_price": 80.0, "item_quantity": 9}]},
             ]},
+            {"escrow_list": [{"order_sn": "A", "order_income": {"voucher_from_seller": 0}}]},
         ])
         self.adapter._shop_ad_spend = AsyncMock(return_value=(0.0, "ready", {}))
 
@@ -153,6 +156,31 @@ class ShopeeDashboardAggregationTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["orders"], 1)
         self.assertEqual(result["units"], 2)
         self.assertEqual(self.adapter._request.await_args_list[1].args[2]["cursor"], "next")
+
+    async def test_shop_dashboard_subtracts_seller_voucher_from_sales(self):
+        self.adapter._request = AsyncMock(side_effect=[
+            {"order_list": [{"order_sn": "A"}]},
+            {"order_list": [{
+                "order_sn": "A",
+                "create_time": 1792713600,
+                "pay_time": 1792713601,
+                "total_amount": 100,
+                "order_status": "COMPLETED",
+                "item_list": [{"model_discounted_price": 499.0, "model_quantity_purchased": 1}],
+            }]},
+            {"escrow_list": [{"order_sn": "A", "order_income": {"voucher_from_seller": 30.0}}]},
+        ])
+        self.adapter._shop_ad_spend = AsyncMock(return_value=(0.0, "ready", {}))
+
+        result = await self.adapter._shop_dashboard(
+            {"shop_id": "1", "market": "MY", "currency": "MYR"},
+            date(2026, 10, 23),
+            date(2026, 10, 23),
+        )
+
+        self.assertEqual(result["sales"], 469.0)
+        self.assertEqual(result["orders"], 1)
+        self.assertEqual(result["units"], 1)
 
     def test_same_market_shops_are_merged(self):
         shops = [{"market": "MY"}, {"market": "MY"}]

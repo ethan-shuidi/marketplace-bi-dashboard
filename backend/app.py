@@ -752,8 +752,8 @@ class ShopeeAdapter:
             (start_date + timedelta(days=index)).isoformat(): self._daily_row(start_date + timedelta(days=index), market)
             for index in range((end_date - start_date).days + 1)
         }
-        sales_source = "Shopee Order API v2 (fallback; not Seller Center Business Insights)"
-        sales_warning = "Shopee Business Insights API 无权限或授权已失效，当前销售指标暂按订单 API 的已确定订单口径返回。开通 Principal Business Insights 权限后会自动切换为卖家中心商业分析口径。"
+        sales_source = "Shopee Order API v2 + Escrow API (Deal Price - Seller Voucher)"
+        sales_warning = "当前销售指标按订单 API 的商品售价扣除卖家优惠券口径返回，仅包含已确认订单，与卖家中心导出的订单数据一致。"
         try:
             performance = await self._shop_sales_performance(shop, start_date, end_date)
         except HTTPException as exc:
@@ -806,16 +806,41 @@ class ShopeeAdapter:
 
             rows_by_sn = {str(item["order_sn"]): item for item in rows if item.get("order_sn")}
             rows = [item for item in rows_by_sn.values() if str(item.get("order_status") or "").upper() in CONFIRMED_ORDER_STATUSES]
+
+            # Batch fetch escrow details to get voucher_from_seller
+            confirmed_sns = [str(item["order_sn"]) for item in rows]
+            voucher_by_sn: dict[str, float] = {}
+            for offset in range(0, len(confirmed_sns), 50):
+                try:
+                    escrow = await self._request(
+                        "/api/v2/payment/get_escrow_detail_batch",
+                        shop,
+                        {"order_sn_list": ",".join(confirmed_sns[offset : offset + 50])},
+                        method="GET",
+                    )
+                    for entry in (escrow.get("escrow_list") or escrow.get("order_list") or []):
+                        sn = str(entry.get("order_sn") or "")
+                        income = entry.get("order_income") or entry
+                        voucher_by_sn[sn] = float(income.get("voucher_from_seller") or 0)
+                except HTTPException:
+                    logger.warning("Escrow detail batch failed for shop_id=%s, seller voucher will be 0", shop.get("shop_id"))
+
             for item in rows:
                 order_date = self._parse_record_date(item.get("create_time") or item.get("pay_time"))
                 if not order_date or order_date.isoformat() not in daily:
                     continue
                 item_units = sum(int(line.get("model_quantity_purchased") or line.get("item_quantity") or 0) for line in (item.get("item_list") or []))
+                deal_price = sum(float(line.get("model_discounted_price") or 0) * int(line.get("model_quantity_purchased") or line.get("item_quantity") or 0) for line in (item.get("item_list") or []))
+                seller_voucher = voucher_by_sn.get(str(item["order_sn"]), 0)
                 day = daily[order_date.isoformat()]
-                day["sales"] += float(item.get("total_amount") or 0)
+                day["sales"] += deal_price - seller_voucher
                 day["orders"] += 1
                 day["units"] += item_units
-            sales = sum(float(item.get("total_amount") or 0) for item in rows)
+            sales = sum(
+                sum(float(line.get("model_discounted_price") or 0) * int(line.get("model_quantity_purchased") or line.get("item_quantity") or 0) for line in (item.get("item_list") or []))
+                - voucher_by_sn.get(str(item["order_sn"]), 0)
+                for item in rows
+            )
             units = sum(int(line.get("model_quantity_purchased") or line.get("item_quantity") or 0) for item in rows for line in (item.get("item_list") or []))
             orders = len(rows)
         ad_spend, ads_status, daily_ad_spend = await self._shop_ad_spend(shop, start_date, end_date)
@@ -1017,8 +1042,8 @@ class ShopeeAdapter:
         sales_sources = {str(row.get("sales_source") or "") for row in rows}
         sales_source = next(iter(sales_sources)) if len(sales_sources) == 1 else "Shopee Business Insights API v2 + Order API fallback"
         exact_business_insights = bool(sales_sources) and all(source.startswith("Shopee Business Insights API") for source in sales_sources)
-        sales_scope = "placed_orders" if exact_business_insights else "confirmed_orders_fallback"
-        sales_scope_note = "与卖家中心商业分析的已下订单口径一致；包含未支付、取消和退款订单，销售额已扣除卖家折扣。" if exact_business_insights else "当前为订单 API 的已确定订单降级口径；要与卖家中心的已下订单完全一致，需要开通 Shopee Principal Business Insights API 权限。"
+        sales_scope = "placed_orders" if exact_business_insights else "confirmed_orders_deal_price_minus_seller_voucher"
+        sales_scope_note = "与卖家中心商业分析的已下订单口径一致；包含未支付、取消和退款订单，销售额已扣除卖家折扣。" if exact_business_insights else "按订单 API 已确认订单的商品售价扣除卖家优惠券（Deal Price - Seller Voucher）口径返回，与卖家中心导出的订单数据一致。"
         sales_warnings = [str(row["sales_warning"]) for row in rows if row.get("sales_warning")]
         return {"platform": "shopee", "configured": True, "mode": "live", "generated_at": datetime.now(timezone.utc).isoformat(), "period": {"start": start_date.isoformat(), "end": end_date.isoformat()}, "currency": result_currency, "currency_note": currency_note, "totals": totals, "markets": self._aggregate_markets(selected, rows), "daily": self._aggregate_daily(rows, start_date, end_date, market), "ads_status": ads_status, "connection_warnings": connection_warnings, "sales_warnings": list(dict.fromkeys(sales_warnings)), "sources": {"orders": sales_source, "ads": "Shopee Ads API v2"}, "sales_scope": sales_scope, "sales_scope_note": sales_scope_note}
 
