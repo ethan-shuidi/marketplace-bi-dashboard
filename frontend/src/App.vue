@@ -7,6 +7,9 @@ const authMessage = ref("")
 const connecting = ref(false)
 const days = ref(7)
 const market = ref("")
+const periodSelect = ref("7")
+const startDate = ref("")
+const endDate = ref("")
 const activePlatform = ref("shopee")
 const data = ref(null)
 const lastLoaded = ref(null)
@@ -34,7 +37,9 @@ const compactNumber = (value) => new Intl.NumberFormat("zh-CN", { notation: "com
 const optionalMoney = (value, currency) => value == null ? "—" : currencyMoney(value, currency)
 const optionalPct = (value) => value == null ? "—" : pct(value)
 const optionalRoi = (value) => value == null ? "—" : `${Number(value).toFixed(2)}x`
-const platformLabel = computed(() => activePlatform.value === "lazada" ? "Lazada" : "Shopee")
+const platformApiPrefix = { shopee: "shopee", lazada: "lazada", tiktok_shop: "tiktok" }
+const platformLabel = computed(() => ({ shopee: "Shopee", lazada: "Lazada", tiktok_shop: "TikTok Shop" }[activePlatform.value] || activePlatform.value))
+const platformsData = ref(null)
 const lastLabel = computed(() => lastLoaded.value ? new Date(lastLoaded.value).toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit" }) : "—")
 const marketRows = computed(() => marketDefinitions.map(definition => {
   const row = (data.value?.markets || []).find(item => item.code === definition.code)
@@ -171,7 +176,13 @@ async function load() {
   loading.value = true
   error.value = ""
   try {
-    const query = new URLSearchParams({ days: String(days.value) })
+    const query = new URLSearchParams()
+    if (periodSelect.value === "custom" && startDate.value && endDate.value) {
+      query.set("start", startDate.value)
+      query.set("end", endDate.value)
+    } else {
+      query.set("days", String(days.value))
+    }
     if (market.value) query.set("market", market.value)
     query.set("platform", activePlatform.value)
     const response = await request(`/api/dashboard?${query}`)
@@ -191,6 +202,11 @@ async function load() {
   }
 }
 
+function applyPeriod() {
+  if (periodSelect.value !== "custom") days.value = Number(periodSelect.value)
+  load()
+}
+
 async function connectMarketplace() {
   const popup = window.open("about:blank", `${activePlatform.value}-auth`, "popup,width=980,height=760")
   connecting.value = true
@@ -201,7 +217,8 @@ async function connectMarketplace() {
     // dashboard filter, not an OAuth scope. Principal ID is persisted when the
     // approved app returns it during token exchange.
     const selectedMarket = activePlatform.value === "shopee" ? "ALL" : (market.value || "MY")
-    const response = await request(`/api/${activePlatform.value}/auth/start?market=${selectedMarket}`)
+    const prefix = platformApiPrefix[activePlatform.value] || activePlatform.value
+    const response = await request(`/api/${prefix}/auth/start?market=${selectedMarket}`)
     const payload = await response.json().catch(() => ({}))
     if (!response.ok || !payload.authorization_url) {
       throw new Error(payload.detail || `无法发起 ${platformLabel.value} 授权`)
@@ -226,7 +243,8 @@ async function connectMarketplace() {
 }
 
 async function loadStatus() {
-  const response = await request(`/api/${activePlatform.value}/status`)
+  const prefix = platformApiPrefix[activePlatform.value] || activePlatform.value
+  const response = await request(`/api/${prefix}/status`)
   if (response.ok) connection.value = await response.json()
 }
 
@@ -237,7 +255,11 @@ async function switchPlatform(platform) {
   await Promise.all([load(), loadStatus()])
 }
 
-onMounted(async () => { await loadRuntimeConfig(); load(); loadStatus() })
+onMounted(async () => {
+  await loadRuntimeConfig()
+  request("/api/platforms").then(r => r.ok ? r.json() : null).then(d => { if (d) platformsData.value = d })
+  load(); loadStatus()
+})
 </script>
 
 <template>
@@ -253,14 +275,14 @@ onMounted(async () => { await loadRuntimeConfig(); load(); loadStatus() })
     </div>
     <header class="topbar">
       <div class="brand"><div class="brand-mark"><span></span><span></span><span></span></div><div><strong>Market Pulse</strong><small>多平台经营看板</small></div></div>
-      <div class="platform-tabs"><button :class="{ active: activePlatform === 'shopee' }" @click="switchPlatform('shopee')">Shopee</button><button :class="{ active: activePlatform === 'lazada' }" @click="switchPlatform('lazada')">Lazada</button><button disabled>TikTok Shop · 即将接入</button></div>
+      <div class="platform-tabs"><button :class="{ active: activePlatform === 'shopee' }" @click="switchPlatform('shopee')">Shopee</button><button :class="{ active: activePlatform === 'lazada' }" @click="switchPlatform('lazada')">Lazada</button><button :class="{ active: activePlatform === 'tiktok_shop' }" :disabled="platformsData?.platforms?.find(p => p.id === 'tiktok_shop')?.status === 'planned'" @click="switchPlatform('tiktok_shop')">TikTok Shop{{ platformsData?.platforms?.find(p => p.id === 'tiktok_shop')?.status === 'planned' ? ' · 即将接入' : '' }}</button></div>
       <div class="actions"><button class="connect" :disabled="connecting" :title="`管理员操作：重新授权 ${platformLabel} 店铺`" @click="connectMarketplace"><span :class="{ spin: connecting }">↗</span> {{ connecting ? "打开授权中" : `连接 ${platformLabel} 店铺` }}</button><button class="refresh" :disabled="loading" @click="load"><span :class="{ spin: loading }">↻</span> 刷新数据</button></div>
     </header>
 
     <main class="page">
       <section class="hero"><div><p class="eyebrow">运营总览 / LIVE VIEW</p><h1>跨境销售脉搏</h1><p class="subtitle">把不同平台的销售与投放数据放进同一张可解释的经营视图。</p></div><div class="live-status"><i></i><span>{{ loading ? "正在拉取" : "已连接" }}</span><small>最近更新 {{ lastLabel }}</small></div></section>
 
-      <section class="toolbar"><label>平台<select :value="activePlatform" :disabled="loading" @change="switchPlatform($event.target.value)"><option value="shopee">Shopee</option><option value="lazada">Lazada</option></select></label><label>站点<select v-model="market" :disabled="loading" @change="load"><option value="">全部站点</option><option value="MY">MY · 马来西亚</option><option value="PH">PH · 菲律宾</option><option value="SG">SG · 新加坡</option><option value="TH">TH · 泰国</option></select></label><div class="periods"><button v-for="item in [7,14,30]" :key="item" :disabled="loading" :class="{ selected: days === item }" @click="days = item; load()">近 {{ item }} 天</button></div></section>
+      <section class="toolbar"><label>平台<select :value="activePlatform" :disabled="loading" @change="switchPlatform($event.target.value)"><option value="shopee">Shopee</option><option value="lazada">Lazada</option><option value="tiktok_shop" :disabled="platformsData?.platforms?.find(p => p.id === 'tiktok_shop')?.status === 'planned'">TikTok Shop</option></select></label><label>站点<select v-model="market" :disabled="loading"><option value="">全部站点</option><option value="MY">MY · 马来西亚</option><option value="PH">PH · 菲律宾</option><option value="SG">SG · 新加坡</option><option value="TH">TH · 泰国</option></select></label><label>时间范围<select v-model="periodSelect" :disabled="loading"><option value="7">近 7 天</option><option value="14">近 14 天</option><option value="30">近 30 天</option><option value="custom">自定义日期</option></select></label><div v-if="periodSelect === 'custom'" class="date-range"><input type="date" v-model="startDate" :disabled="loading" :max="endDate || undefined"><span>—</span><input type="date" v-model="endDate" :disabled="loading" :min="startDate || undefined"></div><button class="query-btn" :disabled="loading || (periodSelect === 'custom' && (!startDate || !endDate))" @click="applyPeriod"><span :class="{ spin: loading }">↻</span> 查询</button></section>
 
       <p v-if="error" class="error">{{ error }}</p>
       <p v-if="authMessage" class="auth-message" role="status">{{ authMessage }}</p>

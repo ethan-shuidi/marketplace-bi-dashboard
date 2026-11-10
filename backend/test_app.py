@@ -87,7 +87,7 @@ class ShopeeDashboardAggregationTest(unittest.IsolatedAsyncioTestCase):
                 "order_status": "COMPLETED",
                 "item_list": [{"model_discounted_price": 40.0, "model_quantity_purchased": 3}],
             }]},
-            {"escrow_list": [{"order_sn": "A", "order_income": {"voucher_from_seller": 0}}]},
+            {"escrow_list": [{"order_sn": "A", "order_income": {"discount_from_voucher_seller": 0}}]},
         ])
         self.adapter._shop_ad_spend = AsyncMock(return_value=(30.0, "ready", {"2026-10-23": 30.0}))
 
@@ -142,7 +142,7 @@ class ShopeeDashboardAggregationTest(unittest.IsolatedAsyncioTestCase):
                 {"order_sn": "B", "create_time": 1792713600, "total_amount": 80,
                  "order_status": "CANCELLED", "item_list": [{"model_discounted_price": 80.0, "item_quantity": 9}]},
             ]},
-            {"escrow_list": [{"order_sn": "A", "order_income": {"voucher_from_seller": 0}}]},
+            {"escrow_list": [{"order_sn": "A", "order_income": {"discount_from_voucher_seller": 0}}]},
         ])
         self.adapter._shop_ad_spend = AsyncMock(return_value=(0.0, "ready", {}))
 
@@ -168,7 +168,7 @@ class ShopeeDashboardAggregationTest(unittest.IsolatedAsyncioTestCase):
                 "order_status": "COMPLETED",
                 "item_list": [{"model_discounted_price": 499.0, "model_quantity_purchased": 1}],
             }]},
-            {"escrow_list": [{"order_sn": "A", "order_income": {"voucher_from_seller": 30.0}}]},
+            {"escrow_list": [{"order_sn": "A", "order_income": {"discount_from_voucher_seller": 30.0}}]},
         ])
         self.adapter._shop_ad_spend = AsyncMock(return_value=(0.0, "ready", {}))
 

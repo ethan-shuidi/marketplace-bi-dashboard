@@ -28,7 +28,7 @@ app.add_middleware(
     allow_origins=["*"],
     allow_credentials=False,
     allow_methods=["GET", "OPTIONS"],
-    allow_headers=["Content-Type"],
+    allow_headers=["Content-Type", "Authorization"],
 )
 
 
@@ -184,6 +184,47 @@ class OAuthStore:
             row = cur.fetchone()
             if row:
                 cur.execute("DELETE FROM lazada_oauth_states WHERE state=%s", (state,))
+            return row
+
+    def init_tiktok(self) -> None:
+        if not self.enabled or getattr(self, "_tiktok_ready", False):
+            return
+        with self.connection() as conn, conn.cursor() as cur:
+            cur.execute("CREATE TABLE IF NOT EXISTS tiktok_oauth_shops (shop_cipher VARCHAR(128) PRIMARY KEY, market VARCHAR(8) NOT NULL, shop_name VARCHAR(256) NULL, access_token TEXT NOT NULL, refresh_token TEXT NULL, expires_at BIGINT NULL, refresh_expires_at BIGINT NULL, currency VARCHAR(16) NULL, updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP)")
+            cur.execute("CREATE TABLE IF NOT EXISTS tiktok_oauth_states (state VARCHAR(128) PRIMARY KEY, market VARCHAR(8) NOT NULL, expires_at BIGINT NOT NULL, created_at BIGINT NOT NULL)")
+        self._tiktok_ready = True
+
+    def save_tiktok_shop(self, shop: dict[str, Any]) -> None:
+        self.init_tiktok()
+        if not self.enabled:
+            return
+        with self.connection() as conn, conn.cursor() as cur:
+            cur.execute("INSERT INTO tiktok_oauth_shops (shop_cipher, market, shop_name, access_token, refresh_token, expires_at, refresh_expires_at, currency) VALUES (%s,%s,%s,%s,%s,%s,%s,%s) ON DUPLICATE KEY UPDATE market=VALUES(market), shop_name=VALUES(shop_name), access_token=VALUES(access_token), refresh_token=VALUES(refresh_token), expires_at=VALUES(expires_at), refresh_expires_at=VALUES(refresh_expires_at), currency=VALUES(currency)", (shop["shop_cipher"], shop.get("market"), shop.get("shop_name"), shop.get("access_token", ""), shop.get("refresh_token"), shop.get("expires_at"), shop.get("refresh_expires_at"), shop.get("currency")))
+
+    def load_tiktok_shops(self) -> list[dict[str, Any]]:
+        self.init_tiktok()
+        if not self.enabled:
+            return []
+        with self.connection() as conn, conn.cursor() as cur:
+            cur.execute("SELECT shop_cipher, market, shop_name, access_token, refresh_token, expires_at, refresh_expires_at, currency FROM tiktok_oauth_shops")
+            return list(cur.fetchall())
+
+    def save_tiktok_state(self, state: str, market: str, expires_at: int) -> None:
+        self.init_tiktok()
+        if not self.enabled:
+            return
+        with self.connection() as conn, conn.cursor() as cur:
+            cur.execute("INSERT INTO tiktok_oauth_states (state, market, expires_at, created_at) VALUES (%s,%s,%s,%s)", (state, market, expires_at, int(time.time())))
+
+    def consume_tiktok_state(self, state: str) -> dict[str, Any] | None:
+        self.init_tiktok()
+        if not self.enabled:
+            return None
+        with self.connection() as conn, conn.cursor() as cur:
+            cur.execute("SELECT state, market, expires_at, created_at FROM tiktok_oauth_states WHERE state=%s", (state,))
+            row = cur.fetchone()
+            if row:
+                cur.execute("DELETE FROM tiktok_oauth_states WHERE state=%s", (state,))
             return row
 class ShopeeAdapter:
     platform = "shopee"
@@ -807,7 +848,6 @@ class ShopeeAdapter:
             rows_by_sn = {str(item["order_sn"]): item for item in rows if item.get("order_sn")}
             rows = [item for item in rows_by_sn.values() if str(item.get("order_status") or "").upper() in CONFIRMED_ORDER_STATUSES]
 
-            # Batch fetch escrow details to get voucher_from_seller
             confirmed_sns = [str(item["order_sn"]) for item in rows]
             voucher_by_sn: dict[str, float] = {}
             for offset in range(0, len(confirmed_sns), 50):
@@ -818,10 +858,11 @@ class ShopeeAdapter:
                         {"order_sn_list": ",".join(confirmed_sns[offset : offset + 50])},
                         method="GET",
                     )
-                    for entry in (escrow.get("escrow_list") or escrow.get("order_list") or []):
+                    escrow_entries = escrow.get("escrow_list") or escrow.get("order_list") or []
+                    for entry in escrow_entries:
                         sn = str(entry.get("order_sn") or "")
                         income = entry.get("order_income") or entry
-                        voucher_by_sn[sn] = float(income.get("voucher_from_seller") or 0)
+                        voucher_by_sn[sn] = float(income.get("discount_from_voucher_seller") or 0)
                 except HTTPException:
                     logger.warning("Escrow detail batch failed for shop_id=%s, seller voucher will be 0", shop.get("shop_id"))
 
@@ -1272,7 +1313,245 @@ class LazadaAdapter:
         return result
 
 
-ADAPTERS: dict[str, MarketplaceAdapter] = {"shopee": ShopeeAdapter(), "lazada": LazadaAdapter()}
+class TikTokShopAdapter:
+    platform = "tiktok_shop"
+    AUTH_URL = "https://auth.tiktok-shops.com/oauth/authorize"
+    TOKEN_URL = "https://auth.tiktok-shops.com/api/v2/token/get"
+    REFRESH_URL = "https://auth.tiktok-shops.com/api/v2/token/refresh"
+    API_BASE = "https://open-api.tiktokglobalshop.com"
+
+    def __init__(self) -> None:
+        self.app_key = os.getenv("TIKTOK_APP_KEY", "").strip()
+        self.app_secret = os.getenv("TIKTOK_APP_SECRET", "").strip()
+        self.redirect_uri = os.getenv("TIKTOK_REDIRECT_URI", "").strip()
+        self.store = OAuthStore()
+        self.oauth_states: dict[str, dict[str, Any]] = {}
+        self.shops: dict[str, dict[str, Any]] = {str(s["shop_cipher"]): s for s in self.store.load_tiktok_shops() if s.get("shop_cipher")}
+        self.access_token = os.getenv("DASHBOARD_ACCESS_TOKEN", "").strip()
+        self.dashboard_cache_ttl = max(15, int(os.getenv("DASHBOARD_CACHE_TTL_SECONDS", "120")))
+        self._dashboard_cache: dict[str, dict[str, Any]] = {}
+        self._dashboard_locks: dict[str, asyncio.Lock] = {}
+        self._api_rate_lock = asyncio.Lock()
+        self._next_api_request_at = 0.0
+        self.api_request_interval = max(0.0, float(os.getenv("TIKTOK_REQUEST_INTERVAL_SECONDS", "0.5")))
+        self.configured = bool(self.app_key and self.app_secret)
+
+    def require_access(self, authorization: str) -> None:
+        scheme, _, supplied = (authorization or "").partition(" ")
+        if not self.access_token or scheme.lower() != "bearer" or not hmac.compare_digest(supplied.strip(), self.access_token):
+            raise HTTPException(401, "需要登录看板", headers={"WWW-Authenticate": "Bearer"})
+
+    def _sign(self, path: str, params: dict[str, Any]) -> str:
+        excluded = {"sign", "access_token"}
+        pairs = sorted((k, str(v)) for k, v in params.items() if k not in excluded and v is not None)
+        base = path + "".join(k + v for k, v in pairs)
+        wrapped = self.app_secret + base + self.app_secret
+        return hmac.new(self.app_secret.encode(), wrapped.encode(), hashlib.sha256).hexdigest()
+
+    def auth_url(self, market: str) -> str:
+        if not self.configured:
+            raise HTTPException(503, "TikTok Shop OAuth 尚未配置 App Key 和 App Secret")
+        state = secrets.token_urlsafe(32)
+        expires_at = int(time.time() + 600)
+        self.oauth_states[state] = {"market": market, "expires_at": expires_at}
+        self.store.save_tiktok_state(state, market, expires_at)
+        query = {"app_key": self.app_key, "state": state}
+        if self.redirect_uri:
+            query["redirect_uri"] = self.redirect_uri
+        return f"{self.AUTH_URL}?{urlencode(query)}"
+
+    async def exchange_code(self, code: str, state_market: str) -> dict[str, Any]:
+        params = {"app_key": self.app_key, "app_secret": self.app_secret, "auth_code": code, "grant_type": "authorized_code"}
+        try:
+            async with httpx.AsyncClient(timeout=httpx.Timeout(30.0, connect=10.0), follow_redirects=True, trust_env=False) as client:
+                resp = await client.get(self.TOKEN_URL, params=params)
+                resp.raise_for_status()
+                body = resp.json()
+        except httpx.HTTPError as exc:
+            raise HTTPException(502, f"TikTok Shop OAuth 换 token 失败：{type(exc).__name__}") from exc
+        if body.get("code") and int(body["code"]) != 0:
+            raise HTTPException(502, f"TikTok Shop OAuth 错误: {body.get('message', body.get('code'))}")
+        data = body.get("data") or body
+        access_token = data.get("access_token", "")
+        refresh_token = data.get("refresh_token", "")
+        expires_at = int(time.time() + int(data.get("access_token_expire_in") or 0))
+        refresh_expires_at = int(time.time() + int(data.get("refresh_token_expire_in") or 0)) if data.get("refresh_token_expire_in") else None
+        records = []
+        # v2 token 不含 authorized_shop_list，需单独调用 shop 授权列表接口
+        shop_list_raw = data.get("authorized_shop_list") or []
+        if not shop_list_raw and access_token:
+            path = "/authorization/202309/shops"
+            timestamp = int(time.time())
+            sign_params: dict[str, Any] = {"app_key": self.app_key, "timestamp": timestamp, "version": "202309"}
+            sign_params["sign"] = self._sign(path, sign_params)
+            sign_params["access_token"] = access_token
+            try:
+                async with httpx.AsyncClient(timeout=15, follow_redirects=True, trust_env=False) as client:
+                    shop_resp = await client.get(f"{self.API_BASE}{path}", params=sign_params)
+                    shop_resp.raise_for_status()
+                    shop_body = shop_resp.json()
+                shop_data = shop_body.get("data") or shop_body
+                shop_list_raw = shop_data.get("shops") or shop_data.get("shop_list") or []
+            except Exception:
+                pass
+        for shop in shop_list_raw:
+            cipher = str(shop.get("shop_cipher") or shop.get("cipher") or "")
+            if not cipher:
+                continue
+            region = str(shop.get("region") or shop.get("shop_region") or state_market).upper()
+            record = {"shop_cipher": cipher, "market": region, "shop_name": shop.get("shop_name"), "access_token": access_token, "refresh_token": refresh_token, "expires_at": expires_at, "refresh_expires_at": refresh_expires_at, "currency": MARKETS.get(region, {}).get("currency")}
+            self.shops[cipher] = record
+            self.store.save_tiktok_shop(record)
+            records.append({"shop_cipher": cipher, "market": region, "shop_name": shop.get("shop_name"), "connected": True})
+        return {"connected": bool(access_token), "shops": records, "expires_in": data.get("access_token_expire_in")}
+
+    async def _refresh_token(self, shop: dict[str, Any]) -> None:
+        rt = shop.get("refresh_token")
+        if not rt:
+            raise HTTPException(424, "TikTok Shop 授权已失效，请重新连接")
+        payload = {"app_key": self.app_key, "app_secret": self.app_secret, "refresh_token": rt, "grant_type": "refresh_token"}
+        try:
+            async with httpx.AsyncClient(timeout=httpx.Timeout(30.0, connect=10.0), follow_redirects=True, trust_env=False) as client:
+                resp = await client.post(self.REFRESH_URL, json=payload)
+                resp.raise_for_status()
+                body = resp.json()
+        except httpx.HTTPError as exc:
+            raise HTTPException(502, f"TikTok Shop token 刷新失败：{type(exc).__name__}") from exc
+        if body.get("code") and int(body["code"]) != 0:
+            raise HTTPException(424, "TikTok Shop 授权已失效，请重新连接")
+        data = body.get("data") or body
+        shop["access_token"] = data.get("access_token", "")
+        shop["refresh_token"] = data.get("refresh_token") or rt
+        shop["expires_at"] = int(time.time() + int(data.get("access_token_expire_in") or 0))
+        self.store.save_tiktok_shop(shop)
+
+    async def _throttle(self) -> None:
+        if self.api_request_interval <= 0:
+            return
+        async with self._api_rate_lock:
+            delay = self._next_api_request_at - time.monotonic()
+            if delay > 0:
+                await asyncio.sleep(delay)
+            self._next_api_request_at = time.monotonic() + self.api_request_interval
+
+    async def _request(self, path: str, shop: dict[str, Any], extra_params: dict[str, Any] | None = None, body: dict[str, Any] | None = None, method: str = "GET") -> dict[str, Any]:
+        if int(shop.get("expires_at") or 0) <= int(time.time()) + 300:
+            await self._refresh_token(shop)
+        timestamp = int(time.time())
+        params: dict[str, Any] = {"app_key": self.app_key, "timestamp": timestamp, "shop_cipher": shop["shop_cipher"], "version": "202309"}
+        if extra_params:
+            params.update(extra_params)
+        params["sign"] = self._sign(path, params)
+        params["access_token"] = shop["access_token"]
+        for attempt in range(4):
+            await self._throttle()
+            try:
+                async with httpx.AsyncClient(timeout=25, follow_redirects=True, trust_env=False) as client:
+                    if method == "GET":
+                        resp = await client.get(f"{self.API_BASE}{path}", params=params)
+                    else:
+                        resp = await client.post(f"{self.API_BASE}{path}", params=params, json=body or {})
+                    resp.raise_for_status()
+                    result = resp.json()
+            except httpx.HTTPStatusError as exc:
+                if exc.response.status_code == 429 and attempt < 3:
+                    await asyncio.sleep(min(1.5 * (2 ** attempt), 10.0))
+                    continue
+                raise HTTPException(502, f"TikTok Shop API 请求失败（HTTP {exc.response.status_code}）") from exc
+            except httpx.HTTPError as exc:
+                raise HTTPException(502, f"TikTok Shop API 请求失败（网络错误：{type(exc).__name__}）") from exc
+            if result.get("code") and int(result["code"]) != 0:
+                msg = result.get("message", result.get("code"))
+                if "rate" in str(msg).lower() and attempt < 3:
+                    await asyncio.sleep(min(1.5 * (2 ** attempt), 10.0))
+                    continue
+                raise HTTPException(502, f"TikTok Shop API 错误: {msg}")
+            return result.get("data") or result
+        raise HTTPException(503, "TikTok Shop API 请求频率过高")
+
+    async def _shop_dashboard(self, shop: dict[str, Any], start_date: date, end_date: date) -> dict[str, Any]:
+        market = str(shop.get("market") or "--")
+        daily: dict[str, dict[str, Any]] = {(start_date + timedelta(days=i)).isoformat(): {"date": (start_date + timedelta(days=i)).isoformat(), "market": market, "sales": 0.0, "orders": 0, "units": 0, "ad_spend": None, "ad_ratio": None, "roi": None} for i in range((end_date - start_date).days + 1)}
+        cursor = ""
+        orders: list[dict[str, Any]] = []
+        start_ts = int(datetime.combine(start_date, datetime.min.time(), tzinfo=SHOP_TIMEZONE).timestamp())
+        end_ts = int(datetime.combine(end_date, datetime.max.time(), tzinfo=SHOP_TIMEZONE).timestamp())
+        while True:
+            params: dict[str, Any] = {"create_time_ge": start_ts, "create_time_lt": end_ts, "page_size": 50}
+            if cursor:
+                params["cursor"] = cursor
+            page = await self._request("/order/202309/orders/search", shop, extra_params=params)
+            for order in (page.get("orders") or []):
+                status = str(order.get("status") or "").upper()
+                if status in {"CANCELLED"}:
+                    continue
+                orders.append(order)
+            next_cursor = page.get("next_cursor") or page.get("next_page_token") or ""
+            if not page.get("orders") or not next_cursor or next_cursor == cursor:
+                break
+            cursor = next_cursor
+        order_ids = [str(o["id"]) for o in orders if o.get("id")]
+        detailed: list[dict[str, Any]] = []
+        for offset in range(0, len(order_ids), 50):
+            batch = order_ids[offset:offset + 50]
+            detail = await self._request("/order/202309/orders", shop, extra_params={"ids": ",".join(batch)})
+            detailed.extend(detail.get("orders") or [])
+        detail_map = {str(d["id"]): d for d in detailed if d.get("id")}
+        for order in orders:
+            oid = str(order.get("id") or "")
+            detail = detail_map.get(oid, order)
+            create_time = int(detail.get("create_time") or order.get("create_time") or 0)
+            if not create_time:
+                continue
+            order_date = datetime.fromtimestamp(create_time, tz=SHOP_TIMEZONE).date().isoformat()
+            if order_date not in daily:
+                continue
+            day = daily[order_date]
+            payment = detail.get("payment") or order.get("payment") or {}
+            total = float(payment.get("total_amount") or payment.get("product_total_amount") or detail.get("total_amount") or order.get("total_amount") or 0)
+            items = detail.get("line_items") or detail.get("item_list") or order.get("line_items") or []
+            units = sum(int(item.get("quantity") or item.get("qty") or 1) for item in items) if items else 1
+            day["sales"] += total
+            day["orders"] += 1
+            day["units"] += units
+        for day in daily.values():
+            day["sales"] = round(day["sales"], 2)
+        sales = round(sum(d["sales"] for d in daily.values()), 2)
+        orders_count = sum(d["orders"] for d in daily.values())
+        units_total = sum(d["units"] for d in daily.values())
+        return {"sales": sales, "orders": orders_count, "units": units_total, "currency": shop.get("currency", "LOCAL"), "ad_spend": None, "ad_ratio": None, "roi": None, "ads_status": "not_configured", "daily": list(daily.values())}
+
+    async def dashboard(self, start_date: date, end_date: date, market: str | None) -> dict[str, Any]:
+        cache_key = f"{start_date.isoformat()}:{end_date.isoformat()}:{market or 'ALL'}"
+        cached = self._dashboard_cache.get(cache_key)
+        if cached and time.monotonic() - cached["stored_at"] <= self.dashboard_cache_ttl:
+            return copy.deepcopy(cached["value"])
+        shops = [s for s in self.shops.values() if not market or s.get("market") == market]
+        if not shops:
+            return {"platform": "tiktok_shop", "configured": self.configured, "mode": "live", "generated_at": datetime.now(timezone.utc).isoformat(), "period": {"start": start_date.isoformat(), "end": end_date.isoformat()}, "currency": MARKETS[market]["currency"] if market in MARKETS else "MIXED", "currency_note": "当前筛选条件下没有已授权的 TikTok Shop 店铺。", "totals": {"sales": 0, "orders": 0, "units": 0, "ad_spend": None, "ad_ratio": None, "roi": None}, "markets": [], "daily": [], "sources": {"orders": "TikTok Shop Orders API v202309"}}
+        rows = [await self._shop_dashboard(s, start_date, end_date) for s in shops]
+        totals = {k: sum(r.get(k) or 0 for r in rows) for k in ("sales", "orders", "units")}
+        totals.update({"ad_spend": None, "ad_ratio": None, "roi": None})
+        grouped: dict[str, dict[str, Any]] = {}
+        for shop, row in zip(shops, rows):
+            m = shop["market"]
+            cur = grouped.setdefault(m, {"code": m, "name": MARKETS.get(m, {}).get("name", "TikTok Shop"), "currency": row["currency"], "sales": 0.0, "orders": 0, "units": 0, "ad_spend": None, "ad_ratio": None, "roi": None, "status": "ready"})
+            for k in ("sales", "orders", "units"):
+                cur[k] += row[k]
+            cur["sales"] = round(cur["sales"], 2)
+        agg_daily: dict[str, dict[str, Any]] = {}
+        for row in rows:
+            for item in row["daily"]:
+                d = agg_daily.setdefault(item["date"], {"date": item["date"], "market": market or "ALL", "sales": 0.0, "orders": 0, "units": 0, "ad_spend": None, "ad_ratio": None, "roi": None})
+                for k in ("sales", "orders", "units"):
+                    d[k] += item[k]
+                d["sales"] = round(d["sales"], 2)
+        result = {"platform": "tiktok_shop", "configured": self.configured, "mode": "live", "generated_at": datetime.now(timezone.utc).isoformat(), "period": {"start": start_date.isoformat(), "end": end_date.isoformat()}, "currency": MARKETS[market]["currency"] if market in MARKETS else "MIXED", "currency_note": "销售额按 TikTok Shop 店铺本币展示。", "totals": totals, "markets": list(grouped.values()), "daily": list(agg_daily.values()), "sources": {"orders": "TikTok Shop Orders API v202309"}}
+        self._dashboard_cache[cache_key] = {"stored_at": time.monotonic(), "value": copy.deepcopy(result)}
+        return result
+
+
+ADAPTERS: dict[str, MarketplaceAdapter] = {"shopee": ShopeeAdapter(), "lazada": LazadaAdapter(), "tiktok_shop": TikTokShopAdapter()}
 
 
 def _day_rows(start_date: date, end_date: date, market: str | None) -> list[dict[str, Any]]:
@@ -1332,7 +1611,8 @@ async def platforms(authorization: str = Header(default="")) -> dict[str, Any]:
     adapter = ADAPTERS["shopee"]
     adapter.require_access(authorization)
     lazada = ADAPTERS["lazada"]
-    return {"platforms": [{"id": "shopee", "name": "Shopee", "status": "connected" if adapter.configured else "demo", "oauth_configured": adapter.configured, "shops": len(adapter.shops) + len(adapter.oauth_shops)}, {"id": "lazada", "name": "Lazada", "status": "connected" if lazada.configured else "planned", "oauth_configured": lazada.configured, "shops": len(lazada.shops)}, {"id": "tiktok_shop", "name": "TikTok Shop", "status": "planned", "oauth_configured": False, "shops": 0}]}
+    tiktok = ADAPTERS["tiktok_shop"]
+    return {"platforms": [{"id": "shopee", "name": "Shopee", "status": "connected" if adapter.configured else "demo", "oauth_configured": adapter.configured, "shops": len(adapter.shops) + len(adapter.oauth_shops)}, {"id": "lazada", "name": "Lazada", "status": "connected" if lazada.configured else "planned", "oauth_configured": lazada.configured, "shops": len(lazada.shops)}, {"id": "tiktok_shop", "name": "TikTok Shop", "status": "connected" if tiktok.configured else "planned", "oauth_configured": tiktok.configured, "shops": len(tiktok.shops)}]}
 
 
 @app.get("/api/shopee/auth/start")
@@ -1382,15 +1662,26 @@ async def lazada_status(authorization: str = Header(default="")) -> dict[str, An
 
 
 @app.get("/api/dashboard")
-async def dashboard(days: int = Query(7, ge=1, le=90), market: str | None = Query(None), platform: str = Query("shopee"), authorization: str = Header(default="")) -> dict[str, Any]:
+async def dashboard(days: int = Query(7, ge=1, le=90), market: str | None = Query(None), platform: str = Query("shopee"), start: str | None = Query(None), end: str | None = Query(None), authorization: str = Header(default="")) -> dict[str, Any]:
     adapter = ADAPTERS.get(platform.lower())
     if not adapter:
         raise HTTPException(400, "unsupported_platform")
     adapter.require_access(authorization)
     if market and market not in MARKETS:
         return {"error": "unsupported_market"}
-    end_date = datetime.now(SHOP_TIMEZONE).date()
-    start_date = end_date - timedelta(days=days - 1)
+    if start and end:
+        try:
+            start_date = date.fromisoformat(start)
+            end_date = date.fromisoformat(end)
+        except ValueError:
+            raise HTTPException(400, "日期格式无效，请使用 YYYY-MM-DD")
+        if end_date < start_date:
+            raise HTTPException(400, "结束日期不能早于开始日期")
+        if (end_date - start_date).days > 89:
+            raise HTTPException(400, "日期范围不能超过 90 天")
+    else:
+        end_date = datetime.now(SHOP_TIMEZONE).date()
+        start_date = end_date - timedelta(days=days - 1)
     return await adapter.dashboard(start_date, end_date, market)
 
 
@@ -1432,3 +1723,37 @@ async def lazada_oauth_callback(code: str | None = None, state: str | None = Non
         raise HTTPException(400, "Lazada OAuth 授权已过期，请重新发起授权")
     result = await adapter.exchange_code(code, str(pending["market"]))
     return {"ok": True, "message": "Lazada 店铺已连接。", "connection": result}
+
+
+@app.get("/api/tiktok/auth/start")
+async def tiktok_auth_start(market: str = Query("MY"), authorization: str = Header(default="")) -> dict[str, Any]:
+    adapter = ADAPTERS["tiktok_shop"]
+    adapter.require_access(authorization)
+    market = market.upper()
+    if market not in MARKETS:
+        raise HTTPException(400, "unsupported_market")
+    return {"authorization_url": adapter.auth_url(market), "market": market}
+
+
+@app.get("/api/tiktok/status")
+async def tiktok_status(authorization: str = Header(default="")) -> dict[str, Any]:
+    adapter = ADAPTERS["tiktok_shop"]
+    adapter.require_access(authorization)
+    return {"configured": adapter.configured, "shops": [{"shop_cipher": sid, "market": s.get("market"), "shop_name": s.get("shop_name"), "connected": bool(s.get("access_token"))} for sid, s in adapter.shops.items()]}
+
+
+@app.get("/api/tiktok/oauth/callback")
+async def tiktok_oauth_callback(code: str | None = None, state: str | None = None, shop_region: str | None = None) -> dict[str, Any]:
+    adapter = ADAPTERS["tiktok_shop"]
+    if not code:
+        raise HTTPException(400, "TikTok Shop OAuth 回调缺少 code")
+    if not state:
+        raise HTTPException(400, "TikTok Shop OAuth 回调缺少 state，请从看板重新发起授权")
+    memory_pending = adapter.oauth_states.pop(state, None)
+    stored_pending = adapter.store.consume_tiktok_state(state)
+    pending = memory_pending or stored_pending
+    if not pending or int(pending["expires_at"]) < int(time.time()):
+        raise HTTPException(400, "TikTok Shop OAuth 授权已过期或无法匹配，请重新发起连接")
+    market = str(pending["market"]) if pending.get("market") else (shop_region.upper() if shop_region else "MY")
+    result = await adapter.exchange_code(code, market)
+    return {"ok": True, "message": "TikTok Shop 店铺已连接。", "connection": result}
