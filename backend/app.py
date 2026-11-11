@@ -1379,26 +1379,24 @@ class TikTokShopAdapter:
         records = []
         shop_list_raw = data.get("authorized_shop_list") or []
         if not shop_list_raw and access_token:
-            for try_path in ("/authorization/202309/shops", "/seller/202309/shops"):
-                timestamp = int(time.time())
-                sign_params: dict[str, Any] = {"app_key": self.app_key, "timestamp": timestamp, "version": "202309"}
-                sign_params["sign"] = self._sign(try_path, sign_params)
-                sign_params["access_token"] = access_token
-                try:
-                    async with httpx.AsyncClient(timeout=15, follow_redirects=True, trust_env=False) as client:
-                        shop_resp = await client.get(f"{self.API_BASE}{try_path}", params=sign_params)
-                        shop_resp.raise_for_status()
-                        shop_body = shop_resp.json()
-                    if shop_body.get("code") and int(shop_body["code"]) != 0:
-                        logger.warning("TikTok shops API %s error: code=%s msg=%s", try_path, shop_body.get("code"), shop_body.get("message"))
-                        continue
+            path = "/authorization/202309/shops"
+            timestamp = int(time.time())
+            sign_params: dict[str, Any] = {"app_key": self.app_key, "timestamp": timestamp}
+            sign_params["sign"] = self._sign(path, sign_params)
+            sign_params["access_token"] = access_token
+            try:
+                async with httpx.AsyncClient(timeout=15, follow_redirects=True, trust_env=False) as client:
+                    shop_resp = await client.get(f"{self.API_BASE}{path}", params=sign_params)
+                    shop_resp.raise_for_status()
+                    shop_body = shop_resp.json()
+                if shop_body.get("code") and int(shop_body["code"]) != 0:
+                    logger.warning("TikTok shops API error: code=%s msg=%s", shop_body.get("code"), shop_body.get("message"))
+                else:
                     shop_data = shop_body.get("data") or shop_body
                     shop_list_raw = shop_data.get("shops") or shop_data.get("shop_list") or shop_data.get("authorized_shop_list") or []
-                    if shop_list_raw:
-                        logger.info("TikTok shops fetched via %s: %d shops", try_path, len(shop_list_raw))
-                        break
-                except Exception as exc:
-                    logger.warning("TikTok shops API %s failed: %s %s", try_path, type(exc).__name__, exc)
+                    logger.info("TikTok shops fetched: %d shops, keys=%s", len(shop_list_raw), sorted(shop_data.keys()) if isinstance(shop_data, dict) else "N/A")
+            except Exception as exc:
+                logger.warning("TikTok shops API failed: %s %s", type(exc).__name__, exc)
         for shop in shop_list_raw:
             cipher = str(shop.get("shop_cipher") or shop.get("cipher") or "")
             if not cipher:
