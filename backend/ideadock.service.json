@@ -17,7 +17,8 @@
     {"path": "/api/lazada/oauth/callback", "methods": ["GET"]},
     {"path": "/api/tiktok/auth/start", "methods": ["GET"]},
     {"path": "/api/tiktok/status", "methods": ["GET"]},
-    {"path": "/api/tiktok/oauth/callback", "methods": ["GET"]}
+    {"path": "/api/tiktok/oauth/callback", "methods": ["GET"]},
+    {"path": "/api/tiktok/retry", "methods": ["GET"]}
   ],
   "resources": {"cpu": "250m", "memory": "256Mi"}
 }

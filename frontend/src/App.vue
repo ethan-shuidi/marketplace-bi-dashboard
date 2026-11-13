@@ -5,6 +5,7 @@ const loading = ref(true)
 const error = ref("")
 const authMessage = ref("")
 const connecting = ref(false)
+const retryingTiktok = ref(false)
 const days = ref(7)
 const market = ref("")
 const periodSelect = ref("7")
@@ -248,6 +249,27 @@ async function loadStatus() {
   if (response.ok) connection.value = await response.json()
 }
 
+async function retryTiktokShops() {
+  retryingTiktok.value = true
+  authMessage.value = ""
+  error.value = ""
+  try {
+    const response = await request("/api/tiktok/retry")
+    if (!response.ok) throw new Error("重试请求失败")
+    const result = await response.json()
+    if (result.ok) {
+      authMessage.value = `TikTok Shop 店铺已连接（${result.shops?.length || 0} 个店铺）`
+      await Promise.all([load(), loadStatus()])
+    } else {
+      error.value = result.hint || result.error || "仍然无法获取店铺列表，请稍后再试"
+    }
+  } catch (err) {
+    error.value = err.message
+  } finally {
+    retryingTiktok.value = false
+  }
+}
+
 async function switchPlatform(platform) {
   if (activePlatform.value === platform || loading.value) return
   activePlatform.value = platform
@@ -276,7 +298,7 @@ onMounted(async () => {
     <header class="topbar">
       <div class="brand"><div class="brand-mark"><span></span><span></span><span></span></div><div><strong>Market Pulse</strong><small>多平台经营看板</small></div></div>
       <div class="platform-tabs"><button :class="{ active: activePlatform === 'shopee' }" @click="switchPlatform('shopee')">Shopee</button><button :class="{ active: activePlatform === 'lazada' }" @click="switchPlatform('lazada')">Lazada</button><button :class="{ active: activePlatform === 'tiktok_shop' }" :disabled="platformsData?.platforms?.find(p => p.id === 'tiktok_shop')?.status === 'planned'" @click="switchPlatform('tiktok_shop')">TikTok Shop{{ platformsData?.platforms?.find(p => p.id === 'tiktok_shop')?.status === 'planned' ? ' · 即将接入' : '' }}</button></div>
-      <div class="actions"><button class="connect" :disabled="connecting" :title="`管理员操作：重新授权 ${platformLabel} 店铺`" @click="connectMarketplace"><span :class="{ spin: connecting }">↗</span> {{ connecting ? "打开授权中" : `连接 ${platformLabel} 店铺` }}</button><button class="refresh" :disabled="loading" @click="load"><span :class="{ spin: loading }">↻</span> 刷新数据</button></div>
+      <div class="actions"><button v-if="activePlatform === 'tiktok_shop' && (connection?.pending_scope || data?.pending_scope)" class="connect retry-btn" :disabled="retryingTiktok" @click="retryTiktokShops"><span :class="{ spin: retryingTiktok }">↻</span> {{ retryingTiktok ? "重试中" : "重试连接" }}</button><button class="connect" :disabled="connecting" :title="`管理员操作：重新授权 ${platformLabel} 店铺`" @click="connectMarketplace"><span :class="{ spin: connecting }">↗</span> {{ connecting ? "打开授权中" : `连接 ${platformLabel} 店铺` }}</button><button class="refresh" :disabled="loading" @click="load"><span :class="{ spin: loading }">↻</span> 刷新数据</button></div>
     </header>
 
     <main class="page">
@@ -286,6 +308,7 @@ onMounted(async () => {
 
       <p v-if="error" class="error">{{ error }}</p>
       <p v-if="authMessage" class="auth-message" role="status">{{ authMessage }}</p>
+      <p v-if="activePlatform === 'tiktok_shop' && (connection?.pending_scope || data?.pending_scope) && !authMessage" class="auth-message pending-scope" role="status">TikTok Shop Token 已获取，但 scope 尚未在 TikTok 服务端同步（seller.authorization.info）。请等待几小时后点击上方「重试连接」按钮。</p>
       <section v-if="loading && !data" class="loading">正在读取平台数据<span></span></section>
       <div v-else class="dashboard-content" :class="{ 'is-loading': loading }" :aria-busy="loading">
         <div v-if="loading" class="loading-overlay" role="status"><span></span><b>正在切换站点并拉取实时数据</b></div>

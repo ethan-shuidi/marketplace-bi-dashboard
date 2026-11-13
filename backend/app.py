@@ -1341,10 +1341,13 @@ class TikTokShopAdapter:
         if not self.access_token or scheme.lower() != "bearer" or not hmac.compare_digest(supplied.strip(), self.access_token):
             raise HTTPException(401, "需要登录看板", headers={"WWW-Authenticate": "Bearer"})
 
-    def _sign(self, path: str, params: dict[str, Any]) -> str:
+    def _sign(self, path: str, params: dict[str, Any], body: dict[str, Any] | None = None) -> str:
         excluded = {"sign", "access_token"}
         pairs = sorted((k, str(v)) for k, v in params.items() if k not in excluded and v is not None)
         base = path + "".join(k + v for k, v in pairs)
+        if body is not None:
+            import json as _json
+            base += _json.dumps(body, separators=(",", ":"), ensure_ascii=False)
         wrapped = self.app_secret + base + self.app_secret
         return hmac.new(self.app_secret.encode(), wrapped.encode(), hashlib.sha256).hexdigest()
 
@@ -1372,31 +1375,19 @@ class TikTokShopAdapter:
         if body.get("code") and int(body["code"]) != 0:
             raise HTTPException(502, f"TikTok Shop OAuth 错误: {body.get('message', body.get('code'))}")
         data = body.get("data") or body
+        safe_keys = sorted(data.keys()) if isinstance(data, dict) else "N/A"
+        print(f"TikTok token exchange ok: keys={safe_keys} granted_scopes={data.get('granted_scopes')} seller={data.get('seller_name')} region={data.get('seller_base_region')} open_id={str(data.get('open_id') or '')[:8]}...")
         access_token = data.get("access_token", "")
         refresh_token = data.get("refresh_token", "")
         expires_at = int(time.time() + int(data.get("access_token_expire_in") or 0))
         refresh_expires_at = int(time.time() + int(data.get("refresh_token_expire_in") or 0)) if data.get("refresh_token_expire_in") else None
         records = []
+        shops_api_error = ""
         shop_list_raw = data.get("authorized_shop_list") or []
         if not shop_list_raw and access_token:
-            path = "/authorization/202309/shops"
-            timestamp = int(time.time())
-            sign_params: dict[str, Any] = {"app_key": self.app_key, "timestamp": timestamp}
-            sign_params["sign"] = self._sign(path, sign_params)
-            sign_params["access_token"] = access_token
-            try:
-                async with httpx.AsyncClient(timeout=15, follow_redirects=True, trust_env=False) as client:
-                    shop_resp = await client.get(f"{self.API_BASE}{path}", params=sign_params)
-                    shop_resp.raise_for_status()
-                    shop_body = shop_resp.json()
-                if shop_body.get("code") and int(shop_body["code"]) != 0:
-                    logger.warning("TikTok shops API error: code=%s msg=%s", shop_body.get("code"), shop_body.get("message"))
-                else:
-                    shop_data = shop_body.get("data") or shop_body
-                    shop_list_raw = shop_data.get("shops") or shop_data.get("shop_list") or shop_data.get("authorized_shop_list") or []
-                    logger.info("TikTok shops fetched: %d shops, keys=%s", len(shop_list_raw), sorted(shop_data.keys()) if isinstance(shop_data, dict) else "N/A")
-            except Exception as exc:
-                logger.warning("TikTok shops API failed: %s %s", type(exc).__name__, exc)
+            shop_list_raw, shops_api_error = await self._fetch_authorized_shops(access_token)
+        if not shop_list_raw and access_token:
+            self._save_pending_token(access_token, refresh_token, expires_at, refresh_expires_at, state_market)
         for shop in shop_list_raw:
             cipher = str(shop.get("shop_cipher") or shop.get("cipher") or "")
             if not cipher:
@@ -1406,7 +1397,107 @@ class TikTokShopAdapter:
             self.shops[cipher] = record
             self.store.save_tiktok_shop(record)
             records.append({"shop_cipher": cipher, "market": region, "shop_name": shop.get("shop_name"), "connected": True})
-        return {"connected": bool(access_token), "shops": records, "expires_in": data.get("access_token_expire_in")}
+        result: dict[str, Any] = {"connected": bool(access_token), "shops": records, "expires_in": data.get("access_token_expire_in")}
+        if not records and access_token:
+            result["pending_token"] = True
+            result["scope_error"] = shops_api_error or "authorized_shop_list empty in token response"
+            result["hint"] = "Token 已获取但无法获取店铺列表。如果 scope 刚刚在 Partner Center 激活，TikTok 可能需要几小时同步。请稍后点击「重试连接」。"
+        return result
+
+    async def _fetch_authorized_shops(self, access_token: str) -> tuple[list[dict[str, Any]], str]:
+        path = "/authorization/202309/shops"
+        timestamp = int(time.time())
+        sign_params: dict[str, Any] = {"app_key": self.app_key, "timestamp": timestamp}
+        sign_params["sign"] = self._sign(path, sign_params)
+        headers = {"x-tts-access-token": access_token}
+        try:
+            async with httpx.AsyncClient(timeout=15, follow_redirects=True, trust_env=False) as client:
+                shop_resp = await client.get(f"{self.API_BASE}{path}", params=sign_params, headers=headers)
+                if shop_resp.status_code != 200:
+                    print(f"TikTok shops API HTTP {shop_resp.status_code} body: {shop_resp.text[:500]}")
+                shop_resp.raise_for_status()
+                shop_body = shop_resp.json()
+            if shop_body.get("code") and int(shop_body["code"]) != 0:
+                error_msg = f"code={shop_body.get('code')} msg={shop_body.get('message')}"
+                print(f"TikTok shops API error: {error_msg}")
+                return [], error_msg
+            shop_data = shop_body.get("data") or shop_body
+            shop_list = shop_data.get("shops") or shop_data.get("shop_list") or shop_data.get("authorized_shop_list") or []
+            print(f"TikTok shops fetched: {len(shop_list)} shops, keys={sorted(shop_data.keys()) if isinstance(shop_data, dict) else 'N/A'}")
+            return shop_list, ""
+        except httpx.HTTPStatusError as exc:
+            error_msg = f"HTTP {exc.response.status_code}: {exc.response.text[:300]}"
+            print(f"TikTok shops API HTTP error: {error_msg}")
+            return [], error_msg
+        except Exception as exc:
+            error_msg = f"{type(exc).__name__}: {exc}"
+            print(f"TikTok shops API failed: {error_msg}")
+            return [], error_msg
+
+    def _save_pending_token(self, access_token: str, refresh_token: str, expires_at: int, refresh_expires_at: int | None, market: str) -> None:
+        """Save token under a pending key so we can retry shops discovery later."""
+        self.store.init_tiktok()
+        if not self.store.enabled:
+            return
+        pending_key = "__pending__"
+        with self.store.connection() as conn, conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO tiktok_oauth_shops (shop_cipher, market, shop_name, access_token, refresh_token, expires_at, refresh_expires_at, currency) "
+                "VALUES (%s,%s,%s,%s,%s,%s,%s,%s) ON DUPLICATE KEY UPDATE market=VALUES(market), access_token=VALUES(access_token), refresh_token=VALUES(refresh_token), expires_at=VALUES(expires_at), refresh_expires_at=VALUES(refresh_expires_at)",
+                (pending_key, market, "pending_scope_propagation", access_token, refresh_token, expires_at, refresh_expires_at, None),
+            )
+        print(f"TikTok pending token saved: market={market} expires_at={expires_at}")
+
+    async def retry_shops_discovery(self) -> dict[str, Any]:
+        """Re-attempt shops API with a previously saved pending token."""
+        self.store.init_tiktok()
+        if not self.store.enabled:
+            return {"ok": False, "error": "database not configured"}
+        with self.store.connection() as conn, conn.cursor() as cur:
+            cur.execute("SELECT * FROM tiktok_oauth_shops WHERE shop_cipher='__pending__'")
+            pending = cur.fetchone()
+        if not pending or not pending.get("access_token"):
+            return {"ok": False, "error": "no pending token found"}
+        access_token = pending["access_token"]
+        market = pending.get("market") or "MY"
+        if int(pending.get("expires_at") or 0) <= int(time.time()):
+            refresh_token = pending.get("refresh_token")
+            if not refresh_token:
+                with self.store.connection() as conn, conn.cursor() as cur:
+                    cur.execute("DELETE FROM tiktok_oauth_shops WHERE shop_cipher='__pending__'")
+                return {"ok": False, "error": "pending token expired and no refresh token"}
+            try:
+                temp_shop = dict(pending)
+                await self._refresh_token(temp_shop)
+                access_token = temp_shop["access_token"]
+                with self.store.connection() as conn, conn.cursor() as cur:
+                    cur.execute(
+                        "UPDATE tiktok_oauth_shops SET access_token=%s, refresh_token=%s, expires_at=%s WHERE shop_cipher='__pending__'",
+                        (temp_shop["access_token"], temp_shop.get("refresh_token", ""), temp_shop.get("expires_at", 0)),
+                    )
+            except HTTPException:
+                with self.store.connection() as conn, conn.cursor() as cur:
+                    cur.execute("DELETE FROM tiktok_oauth_shops WHERE shop_cipher='__pending__'")
+                return {"ok": False, "error": "token refresh failed, please re-authorize"}
+        shop_list, error = await self._fetch_authorized_shops(access_token)
+        if not shop_list:
+            return {"ok": False, "error": error or "still no shops returned", "hint": "TikTok scope 可能仍未同步，请稍后再试。"}
+        records = []
+        refresh_token = pending.get("refresh_token", "")
+        expires_at = int(pending.get("expires_at") or 0)
+        refresh_expires_at = int(pending.get("refresh_expires_at") or 0) if pending.get("refresh_expires_at") else None
+        for shop in shop_list:
+            cipher = str(shop.get("shop_cipher") or shop.get("cipher") or "")
+            if not cipher:
+                continue
+            region = str(shop.get("region") or shop.get("shop_region") or market).upper()
+            record = {"shop_cipher": cipher, "market": region, "shop_name": shop.get("shop_name"), "access_token": access_token, "refresh_token": refresh_token, "expires_at": expires_at, "refresh_expires_at": refresh_expires_at, "currency": MARKETS.get(region, {}).get("currency")}
+            self.shops[cipher] = record
+            self.store.save_tiktok_shop(record)
+            records.append({"shop_cipher": cipher, "market": region, "shop_name": shop.get("shop_name"), "connected": True})
+        with self.store.connection() as conn, conn.cursor() as cur:
+            cur.execute("DELETE FROM tiktok_oauth_shops WHERE shop_cipher='__pending__'")
+        return {"ok": True, "shops": records}
 
     async def _refresh_token(self, shop: dict[str, Any]) -> None:
         rt = shop.get("refresh_token")
@@ -1441,25 +1532,29 @@ class TikTokShopAdapter:
         if int(shop.get("expires_at") or 0) <= int(time.time()) + 300:
             await self._refresh_token(shop)
         timestamp = int(time.time())
-        params: dict[str, Any] = {"app_key": self.app_key, "timestamp": timestamp, "shop_cipher": shop["shop_cipher"], "version": "202309"}
+        params: dict[str, Any] = {"app_key": self.app_key, "timestamp": timestamp, "shop_cipher": shop["shop_cipher"]}
         if extra_params:
             params.update(extra_params)
-        params["sign"] = self._sign(path, params)
-        params["access_token"] = shop["access_token"]
+        import json as _json
+        body_bytes = _json.dumps(body, separators=(",", ":"), ensure_ascii=False).encode() if body and method != "GET" else None
+        params["sign"] = self._sign(path, params, body_bytes.decode() if body_bytes else None)
+        headers = {"x-tts-access-token": str(shop["access_token"]), "content-type": "application/json"} if body_bytes else {"x-tts-access-token": str(shop["access_token"])}
+        print(f"TikTok _request: method={method} path={path} body_bytes={body_bytes[:80] if body_bytes else None}")
         for attempt in range(4):
             await self._throttle()
             try:
                 async with httpx.AsyncClient(timeout=25, follow_redirects=True, trust_env=False) as client:
                     if method == "GET":
-                        resp = await client.get(f"{self.API_BASE}{path}", params=params)
+                        resp = await client.get(f"{self.API_BASE}{path}", params=params, headers=headers)
                     else:
-                        resp = await client.post(f"{self.API_BASE}{path}", params=params, json=body or {})
+                        resp = await client.post(f"{self.API_BASE}{path}", params=params, content=body_bytes or b"{}", headers=headers)
                     resp.raise_for_status()
                     result = resp.json()
             except httpx.HTTPStatusError as exc:
                 if exc.response.status_code == 429 and attempt < 3:
                     await asyncio.sleep(min(1.5 * (2 ** attempt), 10.0))
                     continue
+                print(f"TikTok Shop API error: path={path} HTTP {exc.response.status_code} body={exc.response.text[:400]}")
                 raise HTTPException(502, f"TikTok Shop API 请求失败（HTTP {exc.response.status_code}）") from exc
             except httpx.HTTPError as exc:
                 raise HTTPException(502, f"TikTok Shop API 请求失败（网络错误：{type(exc).__name__}）") from exc
@@ -1480,10 +1575,10 @@ class TikTokShopAdapter:
         start_ts = int(datetime.combine(start_date, datetime.min.time(), tzinfo=SHOP_TIMEZONE).timestamp())
         end_ts = int(datetime.combine(end_date, datetime.max.time(), tzinfo=SHOP_TIMEZONE).timestamp())
         while True:
-            params: dict[str, Any] = {"create_time_ge": start_ts, "create_time_lt": end_ts, "page_size": 50}
+            search_body: dict[str, Any] = {"create_time_ge": start_ts, "create_time_lt": end_ts, "page_size": 50}
             if cursor:
-                params["cursor"] = cursor
-            page = await self._request("/order/202309/orders/search", shop, extra_params=params)
+                search_body["cursor"] = cursor
+            page = await self._request("/order/202309/orders/search", shop, body=search_body, method="POST")
             for order in (page.get("orders") or []):
                 status = str(order.get("status") or "").upper()
                 if status in {"CANCELLED"}:
@@ -1529,9 +1624,13 @@ class TikTokShopAdapter:
         cached = self._dashboard_cache.get(cache_key)
         if cached and time.monotonic() - cached["stored_at"] <= self.dashboard_cache_ttl:
             return copy.deepcopy(cached["value"])
-        shops = [s for s in self.shops.values() if not market or s.get("market") == market]
+        shops = [s for s in self.shops.values() if s.get("shop_cipher") != "__pending__" and (not market or s.get("market") == market)]
         if not shops:
-            return {"platform": "tiktok_shop", "configured": self.configured, "mode": "live", "generated_at": datetime.now(timezone.utc).isoformat(), "period": {"start": start_date.isoformat(), "end": end_date.isoformat()}, "currency": MARKETS[market]["currency"] if market in MARKETS else "MIXED", "currency_note": "当前筛选条件下没有已授权的 TikTok Shop 店铺。", "totals": {"sales": 0, "orders": 0, "units": 0, "ad_spend": None, "ad_ratio": None, "roi": None}, "markets": [], "daily": [], "sources": {"orders": "TikTok Shop Orders API v202309"}}
+            pending = self.shops.get("__pending__")
+            note = "当前筛选条件下没有已授权的 TikTok Shop 店铺。"
+            if pending and pending.get("access_token"):
+                note = "Token 已获取但店铺列表尚未同步。请在 TikTok Shop 面板点击「重试连接」。"
+            return {"platform": "tiktok_shop", "configured": self.configured, "mode": "live", "generated_at": datetime.now(timezone.utc).isoformat(), "period": {"start": start_date.isoformat(), "end": end_date.isoformat()}, "currency": MARKETS[market]["currency"] if market in MARKETS else "MIXED", "currency_note": note, "totals": {"sales": 0, "orders": 0, "units": 0, "ad_spend": None, "ad_ratio": None, "roi": None}, "markets": [], "daily": [], "sources": {"orders": "TikTok Shop Orders API v202309"}, "pending_scope": bool(pending and pending.get("access_token"))}
         rows = [await self._shop_dashboard(s, start_date, end_date) for s in shops]
         totals = {k: sum(r.get(k) or 0 for r in rows) for k in ("sales", "orders", "units")}
         totals.update({"ad_spend": None, "ad_ratio": None, "roi": None})
@@ -1615,7 +1714,7 @@ async def platforms(authorization: str = Header(default="")) -> dict[str, Any]:
     adapter.require_access(authorization)
     lazada = ADAPTERS["lazada"]
     tiktok = ADAPTERS["tiktok_shop"]
-    return {"platforms": [{"id": "shopee", "name": "Shopee", "status": "connected" if adapter.configured else "demo", "oauth_configured": adapter.configured, "shops": len(adapter.shops) + len(adapter.oauth_shops)}, {"id": "lazada", "name": "Lazada", "status": "connected" if lazada.configured else "planned", "oauth_configured": lazada.configured, "shops": len(lazada.shops)}, {"id": "tiktok_shop", "name": "TikTok Shop", "status": "connected" if tiktok.configured else "planned", "oauth_configured": tiktok.configured, "shops": len(tiktok.shops)}]}
+    return {"platforms": [{"id": "shopee", "name": "Shopee", "status": "connected" if adapter.configured else "demo", "oauth_configured": adapter.configured, "shops": len(adapter.shops) + len(adapter.oauth_shops)}, {"id": "lazada", "name": "Lazada", "status": "connected" if lazada.configured else "planned", "oauth_configured": lazada.configured, "shops": len(lazada.shops)}, {"id": "tiktok_shop", "name": "TikTok Shop", "status": "connected" if tiktok.configured else "planned", "oauth_configured": tiktok.configured, "shops": sum(1 for sid in tiktok.shops if sid != "__pending__")}]}
 
 
 @app.get("/api/shopee/auth/start")
@@ -1742,7 +1841,13 @@ async def tiktok_auth_start(market: str = Query("MY"), authorization: str = Head
 async def tiktok_status(authorization: str = Header(default="")) -> dict[str, Any]:
     adapter = ADAPTERS["tiktok_shop"]
     adapter.require_access(authorization)
-    return {"configured": adapter.configured, "shops": [{"shop_cipher": sid, "market": s.get("market"), "shop_name": s.get("shop_name"), "connected": bool(s.get("access_token"))} for sid, s in adapter.shops.items()]}
+    real_shops = {sid: s for sid, s in adapter.shops.items() if sid != "__pending__"}
+    pending = adapter.shops.get("__pending__")
+    result: dict[str, Any] = {"configured": adapter.configured, "shops": [{"shop_cipher": sid, "market": s.get("market"), "shop_name": s.get("shop_name"), "connected": bool(s.get("access_token"))} for sid, s in real_shops.items()]}
+    if pending and pending.get("access_token"):
+        result["pending_scope"] = True
+        result["pending_hint"] = "Token 已获取但 TikTok 尚未同步 seller.authorization.info scope，请点击「重试连接」。"
+    return result
 
 
 @app.get("/api/tiktok/oauth/callback")
@@ -1759,4 +1864,15 @@ async def tiktok_oauth_callback(code: str | None = None, state: str | None = Non
         raise HTTPException(400, "TikTok Shop OAuth 授权已过期或无法匹配，请重新发起连接")
     market = str(pending["market"]) if pending.get("market") else (shop_region.upper() if shop_region else "MY")
     result = await adapter.exchange_code(code, market)
+    if result.get("pending_token"):
+        return {"ok": True, "message": "TikTok Shop Token 已获取，但店铺列表暂时无法获取（scope 可能尚未同步）。请稍后点击「重试连接」。", "connection": result}
     return {"ok": True, "message": "TikTok Shop 店铺已连接。", "connection": result}
+
+
+@app.get("/api/tiktok/retry")
+async def tiktok_retry(authorization: str = Header(default="")) -> dict[str, Any]:
+    adapter = ADAPTERS["tiktok_shop"]
+    adapter.require_access(authorization)
+    result = await adapter.retry_shops_discovery()
+    return result
+
