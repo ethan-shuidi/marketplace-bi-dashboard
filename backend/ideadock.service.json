@@ -18,7 +18,12 @@
     {"path": "/api/tiktok/auth/start", "methods": ["GET"]},
     {"path": "/api/tiktok/status", "methods": ["GET"]},
     {"path": "/api/tiktok/oauth/callback", "methods": ["GET"]},
-    {"path": "/api/tiktok/retry", "methods": ["GET"]}
+    {"path": "/api/tiktok/retry", "methods": ["GET"]},
+    {"path": "/api/tiktok/ads/spend", "methods": ["POST", "GET"]},
+    {"path": "/api/tiktok/ads/callback", "methods": ["GET"]},
+    {"path": "/api/tiktok/ads/auth/start", "methods": ["GET"]},
+    {"path": "/api/tiktok/ads/status", "methods": ["GET"]},
+    {"path": "/api/tiktok/shops/sync", "methods": ["GET"]}
   ],
   "resources": {"cpu": "250m", "memory": "256Mi"}
 }

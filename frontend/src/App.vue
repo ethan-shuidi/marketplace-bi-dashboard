@@ -6,6 +6,8 @@ const error = ref("")
 const authMessage = ref("")
 const connecting = ref(false)
 const retryingTiktok = ref(false)
+const syncingTiktokShops = ref(false)
+const connectingAds = ref(false)
 const days = ref(7)
 const market = ref("")
 const periodSelect = ref("7")
@@ -60,11 +62,15 @@ const cards = computed(() => {
     ]
   }
   const adsReady = data.value?.ads_status === "ready" && singleCurrency
+  const adsUnavailable = data.value?.ads_status === "not_available"
+  const adsMissingDetail = adsUnavailable
+    ? (activePlatform.value === "tiktok_shop" ? "TikTok Open API 未提供广告花费" : "平台未提供广告 API")
+    : (singleCurrency ? "Shopee Ads API 权限" : "请切换到单个站点查看")
   return [
     { label: "销售额", value: currencyMoney(t.sales, data.value?.currency), detail: singleCurrency ? "当前筛选周期" : "请切换到单个站点查看", tone: "teal" },
     { label: "商品销量", value: number(t.units), detail: `${number(t.orders)} 笔订单`, tone: "blue" },
-    { label: "广告花费", value: adsReady ? currencyMoney(t.ad_spend, data.value?.currency) : (singleCurrency ? "待授权" : "多币种"), detail: adsReady ? `占销售额 ${pct(t.ad_ratio)}` : (singleCurrency ? "Shopee Ads API 权限" : "请切换到单个站点查看"), tone: "amber" },
-    { label: "整体 ROI", value: adsReady && t.roi != null ? `${Number(t.roi).toFixed(2)}x` : "—", detail: singleCurrency ? "销售额 / 广告花费" : "请切换到单个站点查看", tone: "violet" },
+    { label: "广告花费", value: adsReady ? currencyMoney(t.ad_spend, data.value?.currency) : (adsUnavailable ? "未接入" : (singleCurrency ? "待授权" : "多币种")), detail: adsReady ? `占销售额 ${pct(t.ad_ratio)}` : adsMissingDetail, tone: "amber" },
+    { label: "整体 ROI", value: adsReady && t.roi != null ? `${Number(t.roi).toFixed(2)}x` : (adsUnavailable ? "未接入" : "—"), detail: adsReady ? "销售额 / 广告花费" : adsMissingDetail, tone: "violet" },
   ]
 })
 
@@ -249,6 +255,55 @@ async function loadStatus() {
   if (response.ok) connection.value = await response.json()
 }
 
+async function connectTiktokAds() {
+  const popup = window.open("about:blank", "tiktok-ads-auth", "popup,width=980,height=760")
+  connectingAds.value = true
+  authMessage.value = "正在打开 TikTok 广告账号授权页"
+  error.value = ""
+  try {
+    const selectedMarket = market.value || "MY"
+    const response = await request(`/api/tiktok/ads/auth/start?market=${selectedMarket}`)
+    const payload = await response.json().catch(() => ({}))
+    if (!response.ok || !payload.authorization_url) {
+      throw new Error(payload.detail || "无法发起 TikTok 广告授权")
+    }
+    if (!popup) {
+      window.location.assign(payload.authorization_url)
+      return
+    }
+    popup.location.href = payload.authorization_url
+    authMessage.value = "已打开广告账号授权页，授权完成后点击「刷新数据」"
+  } catch (err) {
+    if (popup) popup.close()
+    error.value = err.message
+    authMessage.value = ""
+  } finally {
+    connectingAds.value = false
+  }
+}
+
+async function syncTiktokShops() {
+  syncingTiktokShops.value = true
+  authMessage.value = ""
+  error.value = ""
+  try {
+    const response = await request("/api/tiktok/shops/sync")
+    const result = await response.json().catch(() => ({}))
+    if (!response.ok) throw new Error(result.detail || "同步店铺失败")
+    if (result.ok) {
+      const markets = (result.markets || []).join(" / ")
+      authMessage.value = `已同步 ${result.shops?.length || 0} 个店铺${markets ? `（站点：${markets}）` : ""}`
+      await Promise.all([load(), loadStatus()])
+    } else {
+      error.value = (result.errors && result.errors[0]) || result.error || "没有发现新的已授权店铺"
+    }
+  } catch (err) {
+    error.value = err.message
+  } finally {
+    syncingTiktokShops.value = false
+  }
+}
+
 async function retryTiktokShops() {
   retryingTiktok.value = true
   authMessage.value = ""
@@ -298,7 +353,7 @@ onMounted(async () => {
     <header class="topbar">
       <div class="brand"><div class="brand-mark"><span></span><span></span><span></span></div><div><strong>Market Pulse</strong><small>多平台经营看板</small></div></div>
       <div class="platform-tabs"><button :class="{ active: activePlatform === 'shopee' }" @click="switchPlatform('shopee')">Shopee</button><button :class="{ active: activePlatform === 'lazada' }" @click="switchPlatform('lazada')">Lazada</button><button :class="{ active: activePlatform === 'tiktok_shop' }" :disabled="platformsData?.platforms?.find(p => p.id === 'tiktok_shop')?.status === 'planned'" @click="switchPlatform('tiktok_shop')">TikTok Shop{{ platformsData?.platforms?.find(p => p.id === 'tiktok_shop')?.status === 'planned' ? ' · 即将接入' : '' }}</button></div>
-      <div class="actions"><button v-if="activePlatform === 'tiktok_shop' && (connection?.pending_scope || data?.pending_scope)" class="connect retry-btn" :disabled="retryingTiktok" @click="retryTiktokShops"><span :class="{ spin: retryingTiktok }">↻</span> {{ retryingTiktok ? "重试中" : "重试连接" }}</button><button class="connect" :disabled="connecting" :title="`管理员操作：重新授权 ${platformLabel} 店铺`" @click="connectMarketplace"><span :class="{ spin: connecting }">↗</span> {{ connecting ? "打开授权中" : `连接 ${platformLabel} 店铺` }}</button><button class="refresh" :disabled="loading" @click="load"><span :class="{ spin: loading }">↻</span> 刷新数据</button></div>
+      <div class="actions"><button v-if="activePlatform === 'tiktok_shop' && (connection?.pending_scope || data?.pending_scope)" class="connect retry-btn" :disabled="retryingTiktok" @click="retryTiktokShops"><span :class="{ spin: retryingTiktok }">↻</span> {{ retryingTiktok ? "重试中" : "重试连接" }}</button><button v-if="activePlatform === 'tiktok_shop'" class="connect sync-btn" :disabled="syncingTiktokShops" @click="syncTiktokShops"><span :class="{ spin: syncingTiktokShops }">↻</span> {{ syncingTiktokShops ? "同步中" : "同步店铺" }}</button><button v-if="activePlatform === 'tiktok_shop'" class="connect ads-btn" :disabled="connectingAds" @click="connectTiktokAds"><span :class="{ spin: connectingAds }">↗</span> {{ connectingAds ? "打开中" : "连接广告账号" }}</button><button class="connect" :disabled="connecting" :title="`管理员操作：重新授权 ${platformLabel} 店铺`" @click="connectMarketplace"><span :class="{ spin: connecting }">↗</span> {{ connecting ? "打开授权中" : `连接 ${platformLabel} 店铺` }}</button><button class="refresh" :disabled="loading" @click="load"><span :class="{ spin: loading }">↻</span> 刷新数据</button></div>
     </header>
 
     <main class="page">
@@ -317,7 +372,7 @@ onMounted(async () => {
 
         <section v-if="market" class="content-grid single-market"><article class="panel trend-panel"><div class="panel-head"><div><p class="eyebrow">TREND</p><h2>销售与投放趋势</h2></div><span class="unit">{{ data?.currency }} · {{ data?.period.start }} — {{ data?.period.end }}</span></div><div v-if="trendChart.rows.length" class="chart" @mouseleave="hoveredTrendIndex = null"><svg :viewBox="`0 0 ${trendChart.width} ${trendChart.height}`" role="img" aria-label="销售额与广告占比趋势折线图"><defs><linearGradient id="sales-area-gradient" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#17927e" stop-opacity=".2"/><stop offset="100%" stop-color="#17927e" stop-opacity="0"/></linearGradient></defs><g class="chart-grid"><g v-for="line in trendChart.gridLines" :key="line.y"><line :x1="trendChart.padding.left" :x2="trendChart.width - trendChart.padding.right" :y1="line.y" :y2="line.y"/><text class="axis-label axis-left" :x="trendChart.padding.left - 10" :y="line.y + 4" text-anchor="end">{{ compactNumber(line.sales) }}</text><text v-if="activePlatform !== 'lazada'" class="axis-label axis-right" :x="trendChart.width - trendChart.padding.right + 10" :y="line.y + 4">{{ pct(line.ads) }}</text></g></g><text class="axis-title" :x="trendChart.padding.left" y="14">销售额（{{ data?.currency }}）</text><text v-if="activePlatform !== 'lazada'" class="axis-title axis-title-right" :x="trendChart.width - trendChart.padding.right" y="14" text-anchor="end">广告占比</text><path class="sales-area" :d="trendChart.salesAreaPath"/><path class="trend-line sales-line" :d="trendChart.salesPath"/><path v-if="activePlatform !== 'lazada'" class="trend-line ad-line" :d="trendChart.adPath"/><line v-if="hoveredTrend" class="hover-line" :x1="hoveredTrend.x" :x2="hoveredTrend.x" :y1="trendChart.padding.top" :y2="trendChart.baseline"/><g class="sales-points"><circle v-for="(point, index) in trendChart.sales" :key="`sales-${point.row.date}`" :class="{ active: hoveredTrendIndex === index }" :cx="point.x" :cy="point.y" r="4"/></g><g v-if="activePlatform !== 'lazada'" class="ad-points"><circle v-for="(point, index) in trendChart.ads" :key="`ads-${point.row.date}`" :class="{ active: hoveredTrendIndex === index }" :cx="point.x" :cy="point.y" r="4"/></g><text v-for="point in trendChart.sales" :key="`label-${point.row.date}`" class="chart-label" :x="point.x" :y="trendChart.labelY" text-anchor="middle">{{ point.row.date.slice(5) }}</text><g class="hover-zones"><rect v-for="zone in trendChart.hoverZones" :key="zone.index" :x="zone.x" :y="trendChart.padding.top" :width="zone.width" :height="trendChart.baseline - trendChart.padding.top" @mouseenter="hoveredTrendIndex = zone.index"/></g></svg><div v-if="hoveredTrend" class="chart-tooltip" :class="{ first: hoveredTrend.index === 0, last: hoveredTrend.index === trendChart.rows.length - 1 }" :style="{ left: `${hoveredTrend.x / trendChart.width * 100}%`, top: `${hoveredTrend.y / trendChart.height * 100}%` }"><b>{{ hoveredTrend.row.date.slice(5) }}</b><span><i class="teal-dot"></i>销售额<strong>{{ currencyMoney(hoveredTrend.sales.value, data?.currency) }}</strong></span><span v-if="activePlatform !== 'lazada'"><i class="amber-dot"></i>广告占比<strong>{{ pct(hoveredTrend.ads.value) }}</strong></span></div></div><div v-else class="chart-empty">当前周期暂无趋势数据</div><div class="legend"><span><i class="teal-dot"></i>销售额</span><span v-if="activePlatform !== 'lazada'"><i class="amber-dot"></i>广告占比</span></div></article></section>
 
-        <section v-if="market" class="panel source-panel"><div class="panel-head"><div><p class="eyebrow">DATA CONTRACT</p><h2>平台接入状态</h2></div><span class="unit">为后续平台预留统一口径</span></div><div class="source-grid"><div><b>{{ platformLabel }}</b><span :class="{ ready: data?.ads_status === 'ready' || data?.business_advisor_status === 'ready' }">{{ activePlatform === "lazada" ? (data?.business_advisor_status === "ready" ? "Business Advisor 已接入" : "订单已接入 · 生意参谋 API 未公开") : (data?.ads_status === "ready" ? "订单 + 广告已接入" : `订单已接入 · ${platformLabel} 广告待授权`) }}</span></div><div><b>销售数据来源</b><span>{{ data?.sources?.orders || "—" }}</span></div><div><b>口径说明</b><span>{{ data?.sales_scope_note || "—" }}</span></div><div><b>统一指标</b><span>{{ activePlatform === "lazada" ? "买家数 · 订单数 · 平均订单价值 · 售出件数 · 购物篮子数" : "销售额 · 销量 · 广告花费 · ROI" }}</span></div></div></section>
+        <section v-if="market" class="panel source-panel"><div class="panel-head"><div><p class="eyebrow">DATA CONTRACT</p><h2>平台接入状态</h2></div><span class="unit">为后续平台预留统一口径</span></div><div class="source-grid"><div><b>{{ platformLabel }}</b><span :class="{ ready: data?.ads_status === 'ready' || data?.business_advisor_status === 'ready' }">{{ activePlatform === "lazada" ? (data?.business_advisor_status === "ready" ? "Business Advisor 已接入" : "订单已接入 · 生意参谋 API 未公开") : (data?.ads_status === "ready" ? "订单 + 广告已接入" : data?.ads_status === "not_available" ? `订单已接入 · ${platformLabel} 广告未接入（无 Open API）` : `订单已接入 · ${platformLabel} 广告待授权`) }}</span></div><div><b>销售数据来源</b><span>{{ data?.sources?.orders || "—" }}</span></div><div><b>口径说明</b><span>{{ data?.sales_scope_note || "—" }}</span></div><div><b>统一指标</b><span>{{ activePlatform === "lazada" ? "买家数 · 订单数 · 平均订单价值 · 售出件数 · 购物篮子数" : "销售额 · 销量 · 广告花费 · ROI" }}</span></div></div></section>
       </div>
     </main>
   </div>
