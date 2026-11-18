@@ -769,6 +769,7 @@ class ShopeeAdapter:
             "platform": "shopee",
             "configured": True,
             "mode": "live",
+            "authorization_status": status,
             "generated_at": datetime.now(timezone.utc).isoformat(),
             "period": {"start": start_date.isoformat(), "end": end_date.isoformat()},
             "currency": MARKETS[market]["currency"] if market else "MIXED",
@@ -1167,7 +1168,7 @@ class ShopeeAdapter:
         sales_scope = "placed_orders" if exact_business_insights else "confirmed_orders_deal_price_minus_seller_voucher"
         sales_scope_note = "与卖家中心商业分析的已下订单口径一致；包含未支付、取消和退款订单，销售额已扣除卖家折扣。" if exact_business_insights else "按订单 API 已确认订单的商品售价扣除卖家优惠券（Deal Price - Seller Voucher）口径返回，与卖家中心导出的订单数据一致。"
         sales_warnings = [str(row["sales_warning"]) for row in rows if row.get("sales_warning")]
-        return {"platform": "shopee", "configured": True, "mode": "live", "generated_at": datetime.now(timezone.utc).isoformat(), "period": {"start": start_date.isoformat(), "end": end_date.isoformat()}, "currency": result_currency, "currency_note": currency_note, "totals": totals, "markets": self._aggregate_markets(selected, rows), "daily": self._aggregate_daily(rows, start_date, end_date, market), "ads_status": ads_status, "connection_warnings": connection_warnings, "sales_warnings": list(dict.fromkeys(sales_warnings)), "sources": {"orders": sales_source, "ads": "Shopee Ads API v2"}, "sales_scope": sales_scope, "sales_scope_note": sales_scope_note}
+        return {"platform": "shopee", "configured": True, "mode": "live", "authorization_status": "connected", "generated_at": datetime.now(timezone.utc).isoformat(), "period": {"start": start_date.isoformat(), "end": end_date.isoformat()}, "currency": result_currency, "currency_note": currency_note, "totals": totals, "markets": self._aggregate_markets(selected, rows), "daily": self._aggregate_daily(rows, start_date, end_date, market), "ads_status": ads_status, "connection_warnings": connection_warnings, "sales_warnings": list(dict.fromkeys(sales_warnings)), "sources": {"orders": sales_source, "ads": "Shopee Ads API v2"}, "sales_scope": sales_scope, "sales_scope_note": sales_scope_note}
 
 
 class LazadaAdapter:
@@ -1191,6 +1192,7 @@ class LazadaAdapter:
         "units_sold",
         "basket_size",
     )
+    EXCLUDED_ORDER_STATUSES = {"canceled", "cancelled", "failed", "unpaid", "returned", "lost"}
 
     def __init__(self) -> None:
         self.app_key = os.getenv("LAZADA_APP_KEY", "").strip()
@@ -1206,6 +1208,7 @@ class LazadaAdapter:
         self.dashboard_cache_ttl = max(15, int(os.getenv("DASHBOARD_CACHE_TTL_SECONDS", "120")))
         self._dashboard_cache: dict[str, dict[str, Any]] = {}
         self._dashboard_locks: dict[str, asyncio.Lock] = {}
+        self._token_locks: dict[str, asyncio.Lock] = {}
         self._api_rate_lock = asyncio.Lock()
         self._next_api_request_at = 0.0
         self.api_request_interval = max(0.0, float(os.getenv("LAZADA_REQUEST_INTERVAL_SECONDS", "0.35")))
@@ -1286,9 +1289,142 @@ class LazadaAdapter:
                 await asyncio.sleep(delay)
             self._next_api_request_at = time.monotonic() + self.api_request_interval
 
-    async def _request(self, path: str, shop: dict[str, Any], payload: dict[str, Any]) -> dict[str, Any]:
-        if int(shop.get("expires_at") or 0) <= int(time.time()) + 300:
+    @staticmethod
+    def _order_statuses(order: dict[str, Any]) -> set[str]:
+        raw = order.get("statuses")
+        if isinstance(raw, str):
+            values = raw.replace(";", ",").split(",")
+        elif isinstance(raw, (list, tuple, set)):
+            values = list(raw)
+        else:
+            values = []
+        statuses = {str(value).strip().lower() for value in values if str(value).strip()}
+        single = str(order.get("status") or "").strip().lower()
+        if single:
+            statuses.add(single)
+        return statuses
+
+    @staticmethod
+    def _token_payload(body: dict[str, Any]) -> dict[str, Any]:
+        payload = body.get("access_token_response") or body.get("data") or body
+        return payload if isinstance(payload, dict) else {}
+
+    async def _refresh_token(self, shop: dict[str, Any]) -> None:
+        refresh_token = str(shop.get("refresh_token") or "").strip()
+        if not refresh_token:
             raise HTTPException(424, "Lazada 店铺授权已过期，请重新连接")
+        path = "/auth/token/refresh"
+        params = {
+            "app_key": self.app_key,
+            "timestamp": int(time.time() * 1000),
+            "sign_method": "sha256",
+            "refresh_token": refresh_token,
+        }
+        params["sign"] = self._sign(path, params)
+        try:
+            async with httpx.AsyncClient(timeout=httpx.Timeout(30.0, connect=10.0), follow_redirects=True, trust_env=False) as client:
+                response = await client.get(f"{self.token_base}/rest{path}", params=params)
+                response.raise_for_status()
+                body = response.json()
+        except httpx.HTTPError as exc:
+            raise HTTPException(424, "Lazada 授权刷新失败，请重新连接") from exc
+        payload = self._token_payload(body)
+        access_token = str(payload.get("access_token") or "")
+        if not access_token:
+            raise HTTPException(424, "Lazada 授权刷新失败，请重新连接")
+        expires_in = int(payload.get("expires_in") or 0)
+        refresh_expires_in = int(payload.get("refresh_expires_in") or 0)
+        shop["access_token"] = access_token
+        shop["refresh_token"] = str(payload.get("refresh_token") or refresh_token)
+        if expires_in:
+            shop["expires_at"] = int(time.time() + expires_in)
+        if refresh_expires_in:
+            shop["refresh_expires_at"] = int(time.time() + refresh_expires_in)
+        self.store.save_lazada_shop(shop)
+
+    async def _ensure_token(self, shop: dict[str, Any]) -> None:
+        if int(shop.get("expires_at") or 0) > int(time.time()) + 300:
+            return
+        lock = self._token_locks.setdefault(str(shop.get("shop_id") or "default"), asyncio.Lock())
+        async with lock:
+            if int(shop.get("expires_at") or 0) > int(time.time()) + 300:
+                return
+            await self._refresh_token(shop)
+
+    async def _shop_ad_spend(self, shop: dict[str, Any], start_date: date, end_date: date) -> tuple[float | None, dict[str, float], str, str]:
+        today = datetime.now(SHOP_TIMEZONE).date()
+        daily: dict[str, float] = {}
+        notes: list[str] = []
+
+        async def fetch(range_start: date, range_end: date, realtime: bool) -> None:
+            params = {
+                "metricType": 1,
+                "startDate": range_start.isoformat(),
+                "endDate": range_end.isoformat(),
+                "useRtTable": "true" if realtime else "false",
+            }
+            try:
+                data = await self._request("/sponsor/solution/smax/report/getReportOverviewMetric", shop, params)
+            except HTTPException as exc:
+                print(f"Lazada SMAX report failed shop={shop.get('shop_id')} realtime={realtime} detail={str(exc.detail)[:300]}")
+                detail = str(exc.detail or "").lower()
+                if "permission" in detail or "insufficient" in detail or exc.status_code in (401, 403):
+                    raise HTTPException(424, detail) from exc
+                if "no data" in detail or "internal_error" in detail or "not support" in detail or "unsupported" in detail:
+                    notes.append("该店铺没有 Sponsored Max（全站推广）广告数据。")
+                    return
+                raise
+            result = (data.get("result") if isinstance(data, dict) else None) or {}
+            metrics = result.get("metricList") or result.get("metric_list") or []
+            stamps = result.get("dateList") or result.get("date_list") or []
+            if not stamps:
+                stamps = result.get("hourList") or result.get("hour_list") or []
+            if isinstance(metrics, dict):
+                metrics = list(metrics.values())
+            if isinstance(stamps, dict):
+                stamps = list(stamps.values())
+            print(f"Lazada SMAX report shop={shop.get('shop_id')} realtime={realtime} range={range_start}..{range_end} keys={sorted(result.keys())[:20]} metric_len={len(metrics)} date_len={len(result.get('dateList') or [])} hour_len={len(result.get('hourList') or [])} metric_head={str(metrics[:3])[:200]} metric_tail={str(metrics[-3:])[:200]} stamp_head={str(stamps[:3])[:200]} code={(data.get('code') if isinstance(data, dict) else '')} error={(data.get('errorMsg') if isinstance(data, dict) else '')}")
+            if realtime and len(metrics) > 1:
+                try:
+                    numeric = [float(str(value).replace(",", "")) for value in metrics]
+                except (TypeError, ValueError):
+                    numeric = []
+                if numeric and all(current <= following for current, following in zip(numeric, numeric[1:])):
+                    print(f"Lazada SMAX cumulative realtime shop={shop.get('shop_id')} last={numeric[-1]} sum={round(sum(numeric), 2)}")
+                    daily[range_start.isoformat()] = round(numeric[-1], 2)
+                    return
+            for stamp, value in zip(stamps, metrics):
+                try:
+                    if isinstance(value, dict):
+                        value = value.get("value") or value.get("metricValue") or value.get("val") or 0
+                    stamp_int = int(stamp)
+                    if 0 <= stamp_int < 100:
+                        day = range_start.isoformat()
+                    else:
+                        if stamp_int < 10_000_000_000:
+                            stamp_int *= 1000
+                        day = datetime.fromtimestamp(stamp_int / 1000, SHOP_TIMEZONE).date().isoformat()
+                    daily[day] = round(daily.get(day, 0.0) + float(str(value).replace(",", "") or 0), 2)
+                except (TypeError, ValueError, OSError):
+                    continue
+
+        try:
+            historical_end = min(end_date, today - timedelta(days=1))
+            if start_date <= historical_end:
+                await fetch(start_date, historical_end, False)
+            if end_date >= today:
+                await fetch(today, today, True)
+        except HTTPException as exc:
+            if exc.status_code == 424:
+                return None, {}, "permission_required", "需要在 App Console 开通 Sponsored Solutions / Sponsored Max API 权限，并重新授权店铺。"
+            raise
+        total = round(sum(daily.values()), 2)
+        print(f"Lazada SMAX report total shop={shop.get('shop_id')} total={total} days={len(daily)}")
+        status = "ready" if daily or not notes else "not_available"
+        return total, daily, status, notes[0] if notes and not daily else ""
+
+    async def _request(self, path: str, shop: dict[str, Any], payload: dict[str, Any]) -> dict[str, Any]:
+        await self._ensure_token(shop)
         base_params = {"app_key": self.app_key, "timestamp": int(time.time() * 1000), "access_token": shop.get("access_token", ""), "sign_method": "sha256", **payload}
         base_params["sign"] = self._sign(path, base_params)
         for attempt in range(4):
@@ -1306,7 +1442,7 @@ class LazadaAdapter:
             except httpx.HTTPError as exc:
                 raise HTTPException(502, f"Lazada API 请求失败（网络错误：{type(exc).__name__}）") from exc
             if str(body.get("code") or "0") not in {"0", "200"}:
-                error_text = str(body.get("message") or body.get("detail") or body.get("code") or "unknown")
+                error_text = str(body.get("message") or body.get("detail") or body.get("errorMsg") or body.get("code") or "unknown")
                 if "rate" in error_text.lower() and attempt < 3:
                     await asyncio.sleep(min(1.5 * (2 ** attempt), 10.0))
                     continue
@@ -1319,7 +1455,22 @@ class LazadaAdapter:
         return dt.astimezone(SHOP_TIMEZONE).isoformat(timespec="seconds")
 
     async def _shop_dashboard(self, shop: dict[str, Any], start_date: date, end_date: date) -> dict[str, Any]:
-        daily = {(start_date + timedelta(days=index)).isoformat(): {"date": (start_date + timedelta(days=index)).isoformat(), "market": shop["market"], "sales": 0.0, "orders": 0, "units": 0, "buyers": None, "average_order_value": None, "basket_size": None, "ad_spend": None, "ad_ratio": None, "roi": None} for index in range((end_date - start_date).days + 1)}
+        daily = {
+            (start_date + timedelta(days=index)).isoformat(): {
+                "date": (start_date + timedelta(days=index)).isoformat(),
+                "market": shop["market"],
+                "sales": 0.0,
+                "orders": 0,
+                "units": 0,
+                "buyers": None,
+                "average_order_value": None,
+                "basket_size": None,
+                "ad_spend": None,
+                "ad_ratio": None,
+                "roi": None,
+            }
+            for index in range((end_date - start_date).days + 1)
+        }
         orders: list[dict[str, Any]] = []
         offset = 0
         created_after = self._iso(datetime.combine(start_date, datetime.min.time(), tzinfo=SHOP_TIMEZONE))
@@ -1333,12 +1484,18 @@ class LazadaAdapter:
             offset += len(page_orders)
         for order in orders:
             order_date = str(order.get("created_at") or "")[:10]
-            if order_date not in daily or str(order.get("statuses") or "").lower() in {"canceled", "failed"}:
+            if order_date not in daily or self._order_statuses(order) & self.EXCLUDED_ORDER_STATUSES:
                 continue
             day = daily[order_date]
             day["sales"] += float(order.get("price") or 0)
             day["orders"] += 1
             day["units"] += int(order.get("items_count") or 0)
+        ad_spend, ad_daily, ads_status, ads_note = await self._shop_ad_spend(shop, start_date, end_date)
+        for day, spend in ad_daily.items():
+            if day in daily:
+                daily[day]["ad_spend"] = spend
+                daily[day]["ad_ratio"] = round(spend / daily[day]["sales"] * 100, 2) if daily[day]["sales"] else None
+                daily[day]["roi"] = round(daily[day]["sales"] / spend, 2) if spend else None
         sales = round(sum(item["sales"] for item in daily.values()), 2)
         orders_count = sum(item["orders"] for item in daily.values())
         units = sum(item["units"] for item in daily.values())
@@ -1350,14 +1507,15 @@ class LazadaAdapter:
             "average_order_value": round(sales / orders_count, 2) if orders_count else None,
             "basket_size": round(units / orders_count, 2) if orders_count else None,
             "currency": shop.get("currency", "LOCAL"),
-            "ad_spend": None,
-            "ad_ratio": None,
-            "roi": None,
-            "ads_status": "permission_required",
+            "ad_spend": ad_spend,
+            "ad_ratio": round(ad_spend / sales * 100, 2) if ad_spend is not None and sales else None,
+            "roi": round(sales / ad_spend, 2) if ad_spend else None,
+            "ads_status": ads_status,
+            "ads_note": ads_note,
             "business_advisor_status": "not_available",
-            "sales_source": "Lazada GetOrders API (fallback)",
-            "sales_scope": "orders_api_created_orders",
-            "sales_scope_note": "当前使用 Lazada GetOrders 订单明细聚合；这不是 Seller Center「数据洞察 → 生意参谋」口径。",
+            "sales_source": "Lazada GetOrders API",
+            "sales_scope": "orders_api_paid_orders",
+            "sales_scope_note": "销售额来自 Lazada GetOrders 的订单 price，已排除未付款、取消、失败、退货和丢失订单；广告花费来自 Lazada Sponsored Max API。",
             "daily": list(daily.values()),
         }
 
@@ -1367,29 +1525,117 @@ class LazadaAdapter:
         if cached and time.monotonic() - cached["stored_at"] <= self.dashboard_cache_ttl:
             return copy.deepcopy(cached["value"])
         shops = [shop for shop in self.shops.values() if not market or shop.get("market") == market]
+        currency = MARKETS[market]["currency"] if market in MARKETS else "MIXED"
         if not shops:
-            result = {"platform": "lazada", "configured": self.configured, "mode": "live", "generated_at": datetime.now(timezone.utc).isoformat(), "period": {"start": start_date.isoformat(), "end": end_date.isoformat()}, "currency": MARKETS[market]["currency"] if market in MARKETS else "MIXED", "currency_note": "当前筛选条件下没有已授权的 Lazada 店铺。", "totals": {"sales": 0, "orders": 0, "units": 0, "buyers": None, "average_order_value": None, "basket_size": None, "ad_spend": None, "ad_ratio": None, "roi": None}, "markets": [], "daily": [], "ads_status": "permission_required", "business_advisor_status": "not_available", "sources": {"orders": "Lazada GetOrders API (fallback)", "business_advisor": "未提供公开 API", "ads": "待配置 Lazada Advertising API"}, "sales_scope": "orders_api_created_orders", "sales_scope_note": "Lazada Open Platform 当前未公开 Seller Center「数据洞察 → 生意参谋」接口；页面指标暂不能通过官方 API 精确复刻。"}
-            return result
+            return {
+                "platform": "lazada",
+                "configured": self.configured,
+                "mode": "live",
+                "authorization_status": "not_authorized" if self.shops else "not_connected",
+                "generated_at": datetime.now(timezone.utc).isoformat(),
+                "period": {"start": start_date.isoformat(), "end": end_date.isoformat()},
+                "currency": currency,
+                "currency_note": "当前筛选条件下没有已授权的 Lazada 店铺。",
+                "totals": {"sales": 0, "orders": 0, "units": 0, "buyers": None, "average_order_value": None, "basket_size": None, "ad_spend": None, "ad_ratio": None, "roi": None},
+                "markets": [],
+                "daily": [],
+                "ads_status": "permission_required",
+                "business_advisor_status": "not_available",
+                "sources": {"orders": "Lazada GetOrders API", "ads": "Lazada Sponsored Max API"},
+                "sales_scope": "orders_api_paid_orders",
+                "sales_scope_note": "当前筛选条件下没有已授权的 Lazada 店铺。",
+            }
         rows = [await self._shop_dashboard(shop, start_date, end_date) for shop in shops]
         totals = {key: sum(row.get(key) or 0 for row in rows) for key in ("sales", "orders", "units")}
-        totals.update({"buyers": None, "average_order_value": round(totals["sales"] / totals["orders"], 2) if totals["orders"] else None, "basket_size": round(totals["units"] / totals["orders"], 2) if totals["orders"] else None})
+        ad_values = [row.get("ad_spend") for row in rows if row.get("ad_spend") is not None]
+        total_ad = round(sum(ad_values), 2) if ad_values else None
+        totals.update({
+            "buyers": None,
+            "average_order_value": round(totals["sales"] / totals["orders"], 2) if totals["orders"] else None,
+            "basket_size": round(totals["units"] / totals["orders"], 2) if totals["orders"] else None,
+            "ad_spend": total_ad,
+            "ad_ratio": round(total_ad / totals["sales"] * 100, 2) if total_ad is not None and totals["sales"] else None,
+            "roi": round(totals["sales"] / total_ad, 2) if total_ad else None,
+        })
         grouped: dict[str, dict[str, Any]] = {}
         for shop, row in zip(shops, rows):
-            current = grouped.setdefault(shop["market"], {"code": shop["market"], "name": MARKETS[shop["market"]]["name"], "currency": row["currency"], "sales": 0.0, "orders": 0, "units": 0, "buyers": None, "average_order_value": None, "basket_size": None, "ad_spend": None, "ad_ratio": None, "roi": None, "ads_status": "permission_required", "business_advisor_status": "not_available", "status": "ready"})
+            current = grouped.setdefault(shop["market"], {
+                "code": shop["market"],
+                "name": MARKETS[shop["market"]]["name"],
+                "currency": row["currency"],
+                "sales": 0.0,
+                "orders": 0,
+                "units": 0,
+                "buyers": None,
+                "average_order_value": None,
+                "basket_size": None,
+                "ad_spend": None,
+                "ad_ratio": None,
+                "roi": None,
+                "ads_status": row["ads_status"],
+                "business_advisor_status": "not_available",
+                "status": "ready",
+            })
             for key in ("sales", "orders", "units"):
                 current[key] += row[key]
-            current["average_order_value"] = round(current["sales"] / current["orders"], 2) if current["orders"] else None
-            current["basket_size"] = round(current["units"] / current["orders"], 2) if current["orders"] else None
-        daily = {}
+            if row.get("ad_spend") is not None:
+                current["ad_spend"] = round((current["ad_spend"] or 0) + row["ad_spend"], 2)
+            if row["ads_status"] != "ready":
+                current["ads_status"] = row["ads_status"]
+        daily: dict[str, dict[str, Any]] = {}
         for row in rows:
             for item in row["daily"]:
-                current = daily.setdefault(item["date"], {"date": item["date"], "market": market or "ALL", "sales": 0.0, "orders": 0, "units": 0, "buyers": None, "average_order_value": None, "basket_size": None, "ad_spend": None, "ad_ratio": None, "roi": None})
+                current = daily.setdefault(item["date"], {
+                    "date": item["date"],
+                    "market": market or "ALL",
+                    "sales": 0.0,
+                    "orders": 0,
+                    "units": 0,
+                    "buyers": None,
+                    "average_order_value": None,
+                    "basket_size": None,
+                    "ad_spend": None,
+                    "ad_ratio": None,
+                    "roi": None,
+                })
                 for key in ("sales", "orders", "units"):
                     current[key] += item[key]
-                current["average_order_value"] = round(current["sales"] / current["orders"], 2) if current["orders"] else None
-                current["basket_size"] = round(current["units"] / current["orders"], 2) if current["orders"] else None
-        totals.update({"ad_spend": None, "ad_ratio": None, "roi": None})
-        result = {"platform": "lazada", "configured": self.configured, "mode": "live", "generated_at": datetime.now(timezone.utc).isoformat(), "period": {"start": start_date.isoformat(), "end": end_date.isoformat()}, "currency": MARKETS[market]["currency"] if market in MARKETS else "MIXED", "currency_note": "销售额按 Lazada 店铺本币展示；全部站点不跨币种合计。", "totals": totals, "markets": list(grouped.values()), "daily": list(daily.values()), "ads_status": "permission_required", "business_advisor_status": "not_available", "sources": {"orders": "Lazada GetOrders API (fallback)", "business_advisor": "未提供公开 API", "ads": "待配置 Lazada Advertising API"}, "sales_scope": "orders_api_created_orders", "sales_scope_note": "销售额来自 Lazada GetOrders 的订单 price，取消和失败订单已排除；这不是 Seller Center「数据洞察 → 生意参谋」口径。买家数、购物篮子数等页面指标暂未提供官方 Open Platform API。"}
+                if item.get("ad_spend") is not None:
+                    current["ad_spend"] = round((current["ad_spend"] or 0) + item["ad_spend"], 2)
+        for current in list(grouped.values()) + list(daily.values()):
+            current["average_order_value"] = round(current["sales"] / current["orders"], 2) if current["orders"] else None
+            current["basket_size"] = round(current["units"] / current["orders"], 2) if current["orders"] else None
+            current["ad_ratio"] = round(current["ad_spend"] / current["sales"] * 100, 2) if current.get("ad_spend") is not None and current["sales"] else None
+            current["roi"] = round(current["sales"] / current["ad_spend"], 2) if current.get("ad_spend") else None
+        statuses = {row["ads_status"] for row in rows}
+        if statuses == {"ready"}:
+            ads_status = "ready"
+        elif "permission_required" in statuses:
+            ads_status = "permission_required"
+        elif "not_available" in statuses:
+            ads_status = "not_available"
+        else:
+            ads_status = "permission_required"
+        ads_note = next((row.get("ads_note") for row in rows if row.get("ads_note")), "")
+        result = {
+            "platform": "lazada",
+            "configured": self.configured,
+            "mode": "live",
+            "authorization_status": "connected",
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+            "period": {"start": start_date.isoformat(), "end": end_date.isoformat()},
+            "currency": currency,
+            "currency_note": "销售额按 Lazada 店铺本币展示；全部站点不跨币种合计。",
+            "totals": totals,
+            "markets": list(grouped.values()),
+            "daily": list(daily.values()),
+            "ads_status": ads_status,
+            "ads_note": ads_note,
+            "business_advisor_status": "not_available",
+            "sources": {"orders": "Lazada GetOrders API", "ads": "Lazada Sponsored Max API" if ads_status == "ready" else "Lazada Sponsored Max API（未授权或无权限）"},
+            "sales_scope": "orders_api_paid_orders",
+            "sales_scope_note": "销售额来自 Lazada GetOrders 的订单 price，已排除未付款、取消、失败、退货和丢失订单；广告花费来自 Lazada Sponsored Max API，整体 ROI = 销售额 / 广告花费。",
+        }
         self._dashboard_cache[cache_key] = {"stored_at": time.monotonic(), "value": copy.deepcopy(result)}
         return result
 
@@ -1792,7 +2038,7 @@ class TikTokShopAdapter:
             note = "当前筛选条件下没有已授权的 TikTok Shop 店铺。"
             if pending and pending.get("access_token"):
                 note = "Token 已获取但店铺列表尚未同步。请在 TikTok Shop 面板点击「重试连接」。"
-            return {"platform": "tiktok_shop", "configured": self.configured, "mode": "live", "generated_at": datetime.now(timezone.utc).isoformat(), "period": {"start": start_date.isoformat(), "end": end_date.isoformat()}, "currency": MARKETS[market]["currency"] if market in MARKETS else "MIXED", "currency_note": note, "totals": {"sales": 0, "orders": 0, "units": 0, "ad_spend": None, "ad_ratio": None, "roi": None}, "markets": [], "daily": [], "ads_status": "not_available", "sources": {"orders": "TikTok Shop Orders API v202309", "ads": ADS_SOURCE_NOTE}, "pending_scope": bool(pending and pending.get("access_token"))}
+            return {"platform": "tiktok_shop", "configured": self.configured, "mode": "live", "authorization_status": "not_authorized" if self.shops else "not_connected", "generated_at": datetime.now(timezone.utc).isoformat(), "period": {"start": start_date.isoformat(), "end": end_date.isoformat()}, "currency": MARKETS[market]["currency"] if market in MARKETS else "MIXED", "currency_note": note, "totals": {"sales": 0, "orders": 0, "units": 0, "ad_spend": None, "ad_ratio": None, "roi": None}, "markets": [], "daily": [], "ads_status": "not_available", "sources": {"orders": "TikTok Shop Orders API v202309", "ads": ADS_SOURCE_NOTE}, "pending_scope": bool(pending and pending.get("access_token"))}
         rows = [await self._shop_dashboard(s, start_date, end_date) for s in shops]
         totals = {k: sum(r.get(k) or 0 for r in rows) for k in ("sales", "orders", "units")}
         totals.update({"ad_spend": None, "ad_ratio": None, "roi": None})
@@ -1845,7 +2091,7 @@ class TikTokShopAdapter:
                 only["ad_ratio"] = totals["ad_ratio"]
                 only["roi"] = totals["roi"]
             ads_source = "TikTok Marketing API /report/integrated/get (AUCTION_ADVERTISER)"
-        result = {"platform": "tiktok_shop", "configured": self.configured, "mode": "live", "generated_at": datetime.now(timezone.utc).isoformat(), "period": {"start": start_date.isoformat(), "end": end_date.isoformat()}, "currency": result_currency, "currency_note": "销售额按 TikTok Shop 店铺本币展示。", "totals": totals, "markets": list(grouped.values()), "daily": list(agg_daily.values()), "ads_status": ads_status, "sources": {"orders": "TikTok Shop Orders API v202309", "ads": ads_source}}
+        result = {"platform": "tiktok_shop", "configured": self.configured, "mode": "live", "authorization_status": "connected", "generated_at": datetime.now(timezone.utc).isoformat(), "period": {"start": start_date.isoformat(), "end": end_date.isoformat()}, "currency": result_currency, "currency_note": "销售额按 TikTok Shop 店铺本币展示。", "totals": totals, "markets": list(grouped.values()), "daily": list(agg_daily.values()), "ads_status": ads_status, "sources": {"orders": "TikTok Shop Orders API v202309", "ads": ads_source}}
         self._dashboard_cache[cache_key] = {"stored_at": time.monotonic(), "value": copy.deepcopy(result)}
         return result
 
@@ -2031,19 +2277,35 @@ def demo_dashboard(start_date: date, end_date: date, market: str | None, configu
     orders = round(sum(row["orders"] for row in daily) * multiplier)
     units = round(sum(row["units"] for row in daily) * multiplier)
     ad_spend = round(sum(row["ad_spend"] for row in daily) * multiplier, 2)
+    market_rows = []
+    for index, code in enumerate(markets):
+        market_sales = round(sales / len(markets) * (1 + index * 0.08), 2)
+        market_ad_spend = round(ad_spend / len(markets) * (1 + index * 0.06), 2)
+        market_rows.append({
+            "code": code,
+            "name": MARKETS[code]["name"],
+            "currency": MARKETS[code]["currency"],
+            "sales": market_sales,
+            "orders": round(orders / len(markets) * (1 + index * 0.05)),
+            "units": round(units / len(markets) * (1 + index * 0.03)),
+            "ad_spend": market_ad_spend,
+            "ad_ratio": round(market_ad_spend / market_sales * 100, 2) if market_sales else None,
+            "roi": round(market_sales / market_ad_spend, 2) if market_ad_spend else None,
+            "status": "ready" if configured else "demo",
+        })
     return {
         "platform": "shopee",
         "configured": configured,
+        "mode": "demo",
+        "authorization_status": "demo",
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "period": {"start": start_date.isoformat(), "end": end_date.isoformat()},
         "currency": "USD*" if not market else MARKETS[market]["currency"],
         "currency_note": "演示数据按统一展示币种模拟；真实接入后按站点本币及汇率配置返回。",
         "totals": {"sales": sales, "orders": orders, "units": units, "ad_spend": ad_spend, "ad_ratio": round(ad_spend / sales * 100, 2), "roi": round(sales / ad_spend, 2)},
-        "markets": [
-            {"code": code, "name": MARKETS[code]["name"], "currency": MARKETS[code]["currency"], "sales": round(sales / len(markets) * (1 + i * 0.08), 2), "orders": round(orders / len(markets) * (1 + i * 0.05)), "ad_spend": round(ad_spend / len(markets) * (1 + i * 0.06), 2), "status": "ready" if configured else "demo"}
-            for i, code in enumerate(markets)
-        ],
+        "markets": market_rows,
         "daily": daily,
+        "ads_status": "ready",
         "sources": {"orders": "Shopee Order API", "ads": "Shopee Ads Daily Performance API"},
     }
 

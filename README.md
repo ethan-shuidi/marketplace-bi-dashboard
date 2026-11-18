@@ -68,8 +68,18 @@ LAZADA_TOKEN_BASE       # 可选，默认使用 LAZADA_AUTH_BASE
 LAZADA_API_BASE         # 可选；不设置时按站点选择官方 API 域名
 ```
 
-回调地址使用 `LAZADA_REDIRECT_URI`，并在 Lazada App Console 中登记。看板的“连接 Lazada 店铺”按钮按站点发起 OAuth，授权完成后 token 会写入 IdeaDock MySQL。当前销售额、订单数和售出件数来自 `GetOrders`，属于订单明细降级口径；平均订单价值和购物篮子数仅由该口径估算，买家数不会伪造为订单数。
+回调地址使用 `LAZADA_REDIRECT_URI`，并在 Lazada App Console 中登记。看板的“连接 Lazada 店铺”按钮按站点发起 OAuth，授权完成后 token 会写入 IdeaDock MySQL。Lazada 是分站点授权：MY/PH/SG/TH 需要分别授权；Seller In-house 应用不支持 Crossborder。
 
-Lazada Seller Center 的“数据洞察 → 生意参谋”指标（买家数、平均订单价值、售出件数、购物篮子数及其趋势）目前没有出现在 Lazada Open Platform 的公开 API 目录中。公开目录提供的 Sponsored Solutions 报表只覆盖广告指标，不能替代生意参谋。接口返回 `business_advisor_status=not_available`、`sales_scope=orders_api_created_orders` 和 `sales_scope_note`，前端会明确显示降级口径；后续如果 Lazada 为该页面开放正式 API，再替换适配器即可。
+看板 Lazada 指标与 Shopee 对齐：销售额、商品销量、广告花费、整体 ROI。销售额和销量来自 `GetOrders`，已排除未付款、取消、失败、退货和丢失订单；广告花费来自 Lazada Sponsored Max（SMAX）报表接口 `sponsor/solution/smax/report/getReportOverviewMetric`。启用广告数据需要：
+
+- 在 App Console 为应用申请/开通 Sponsored Solutions / Sponsored Max API 权限；
+- 开通后重新授权店铺（token 权限在授权时快照）；
+- 店铺本身有 Sponsored Discovery 广告账户。
+
+如果权限未开通或没有广告账户，接口返回 `ads_status=permission_required` 或 `not_available`，前端显示“待授权”或“未接入”，不会把广告花费伪造成 0 以外的值。
+
+Lazada access token 在 Testing 状态约 1 天有效，Online 状态为 30 天、refresh token 180 天。后端会在过期前调用 `/auth/token/refresh` 自动刷新；正式使用建议在 App Console 提交 Apply Online，避免每天重新授权。
+
+Lazada Seller Center 的“数据洞察 → 生意参谋”指标（买家数、平均订单价值、购物篮子数）目前没有公开 API，因此看板不再展示这些指标。
 
 Lazada API 路由：`/api/lazada/auth/start`、`/api/lazada/oauth/callback`、`/api/lazada/status`；统一看板通过 `/api/dashboard?platform=lazada` 读取数据，原有 `/api/dashboard` 仍默认读取 Shopee。

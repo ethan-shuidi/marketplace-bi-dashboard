@@ -7,7 +7,7 @@ from unittest.mock import AsyncMock, Mock, patch
 import httpx
 from fastapi import HTTPException
 
-from app import LazadaAdapter, ShopeeAdapter
+from app import LazadaAdapter, ShopeeAdapter, TikTokShopAdapter, demo_dashboard
 
 
 class LazadaAdapterContractTest(unittest.IsolatedAsyncioTestCase):
@@ -23,27 +23,63 @@ class LazadaAdapterContractTest(unittest.IsolatedAsyncioTestCase):
         adapter.api_base = ""
         self.assertEqual(adapter._api_url("MY"), "https://api.lazada.com.my/rest")
 
-    async def test_lazada_orders_are_explicitly_marked_as_business_advisor_fallback(self):
+    async def test_lazada_orders_exclude_unpaid_canceled_and_failed(self):
         adapter = LazadaAdapter.__new__(LazadaAdapter)
         adapter._request = AsyncMock(return_value={
-            "orders": [{
-                "created_at": "2026-10-23 10:00:00",
-                "price": "100.00",
-                "items_count": 2,
-                "statuses": "confirmed",
-            }],
-            "countTotal": 1,
+            "orders": [
+                {"created_at": "2026-10-23 10:00:00", "price": "100.00", "items_count": 2, "statuses": ["ready_to_ship"]},
+                {"created_at": "2026-10-23 11:00:00", "price": "50.00", "items_count": 1, "statuses": ["canceled"]},
+                {"created_at": "2026-10-23 12:00:00", "price": "40.00", "items_count": 1, "statuses": ["unpaid"]},
+                {"created_at": "2026-10-23 13:00:00", "price": "30.00", "items_count": 1, "statuses": ["failed"]},
+            ],
+            "countTotal": 4,
         })
+        adapter._shop_ad_spend = AsyncMock(return_value=(10.0, {"2026-10-23": 10.0}, "ready", ""))
         adapter._iso = lambda value: value.isoformat()
         result = await adapter._shop_dashboard(
             {"market": "MY", "currency": "MYR", "expires_at": int(time.time()) + 3600},
             date(2026, 10, 23),
             date(2026, 10, 23),
         )
-        self.assertEqual(result["sales_source"], "Lazada GetOrders API (fallback)")
-        self.assertEqual(result["business_advisor_status"], "not_available")
-        self.assertEqual(result["sales_scope"], "orders_api_created_orders")
+        self.assertEqual(result["sales"], 100.0)
+        self.assertEqual(result["orders"], 1)
+        self.assertEqual(result["units"], 2)
+        self.assertEqual(result["ad_spend"], 10.0)
+        self.assertEqual(result["ad_ratio"], 10.0)
+        self.assertEqual(result["roi"], 10.0)
+        self.assertEqual(result["ads_status"], "ready")
+        self.assertEqual(result["sales_source"], "Lazada GetOrders API")
+        self.assertEqual(result["sales_scope"], "orders_api_paid_orders")
         self.assertIsNone(result["buyers"])
+
+    async def test_lazada_ads_report_returns_daily_spend(self):
+        adapter = LazadaAdapter.__new__(LazadaAdapter)
+        adapter._request = AsyncMock(return_value={
+            "result": {
+                "metricList": [1.5, 2.5],
+                "dateList": [1761177600000, 1761264000000],
+            }
+        })
+        total, daily, status, note = await adapter._shop_ad_spend(
+            {"market": "MY"},
+            date(2026, 10, 23),
+            date(2026, 10, 24),
+        )
+        self.assertEqual(status, "ready")
+        self.assertEqual(total, 4.0)
+        self.assertEqual(len(daily), 2)
+        self.assertEqual(adapter._request.await_args.args[0], "/sponsor/solution/smax/report/getReportOverviewMetric")
+
+    async def test_lazada_ads_permission_error_is_not_fatal(self):
+        adapter = LazadaAdapter.__new__(LazadaAdapter)
+        adapter._request = AsyncMock(side_effect=HTTPException(502, "Lazada API 错误: InsufficientPermission"))
+        total, daily, status, note = await adapter._shop_ad_spend(
+            {"market": "MY"},
+            date(2026, 10, 23),
+            date(2026, 10, 23),
+        )
+        self.assertIsNone(total)
+        self.assertEqual(status, "permission_required")
 
 
 class ShopeeDashboardAggregationTest(unittest.IsolatedAsyncioTestCase):
@@ -269,6 +305,7 @@ class ShopeeDashboardAggregationTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["totals"]["sales"], 100.0)
         self.assertEqual(result["totals"]["orders"], 2)
         self.assertEqual(result["markets"][0]["sales"], 100.0)
+        self.assertEqual(result["authorization_status"], "connected")
         self.assertEqual(result["connection_warnings"], [{
             "shop_id": "1",
             "message": "Shopee 店铺授权已失效，请重新连接",
@@ -357,6 +394,54 @@ class ShopeeDashboardAggregationTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result, {"ok": True})
         self.assertEqual(client.get.await_count, 2)
         sleep.assert_awaited_once()
+
+    def test_empty_dashboard_marks_unauthorized_state(self):
+        empty = self.adapter._live_empty_dashboard(date(2026, 10, 21), date(2026, 10, 23), "MY", 0)
+        self.assertEqual(empty["authorization_status"], "not_connected")
+
+        expired = self.adapter._live_empty_dashboard(date(2026, 10, 21), date(2026, 10, 23), "MY", 2)
+        self.assertEqual(expired["authorization_status"], "not_authorized")
+
+    def test_demo_dashboard_is_marked_and_has_complete_market_metrics(self):
+        result = demo_dashboard(date(2026, 10, 21), date(2026, 10, 23), "MY", configured=False)
+
+        self.assertEqual(result["mode"], "demo")
+        self.assertEqual(result["authorization_status"], "demo")
+        self.assertEqual(result["ads_status"], "ready")
+        self.assertTrue(all(row["units"] > 0 for row in result["markets"]))
+        self.assertTrue(all(row["ad_ratio"] is not None for row in result["markets"]))
+        self.assertTrue(all(row["roi"] is not None for row in result["markets"]))
+
+
+class PlatformAuthorizationStateTest(unittest.IsolatedAsyncioTestCase):
+    async def test_lazada_empty_dashboard_marks_authorization_state(self):
+        adapter = LazadaAdapter.__new__(LazadaAdapter)
+        adapter.configured = True
+        adapter.shops = {}
+        adapter._dashboard_cache = {}
+        adapter.dashboard_cache_ttl = 120
+
+        empty = await adapter.dashboard(date(2026, 10, 21), date(2026, 10, 23), "MY")
+        self.assertEqual(empty["authorization_status"], "not_connected")
+
+        adapter.shops = {"1": {"shop_id": "1", "market": "MY", "access_token": "token"}}
+        missing_market = await adapter.dashboard(date(2026, 10, 21), date(2026, 10, 23), "TH")
+        self.assertEqual(missing_market["authorization_status"], "not_authorized")
+
+    async def test_tiktok_empty_dashboard_marks_authorization_state(self):
+        adapter = TikTokShopAdapter.__new__(TikTokShopAdapter)
+        adapter.configured = True
+        adapter.shops = {}
+        adapter._dashboard_cache = {}
+        adapter.dashboard_cache_ttl = 120
+
+        empty = await adapter.dashboard(date(2026, 10, 21), date(2026, 10, 23), "MY")
+        self.assertEqual(empty["authorization_status"], "not_connected")
+
+        adapter.shops = {"__pending__": {"access_token": "token"}}
+        pending = await adapter.dashboard(date(2026, 10, 21), date(2026, 10, 23), "MY")
+        self.assertEqual(pending["authorization_status"], "not_authorized")
+        self.assertTrue(pending["pending_scope"])
 
 
 if __name__ == "__main__":
