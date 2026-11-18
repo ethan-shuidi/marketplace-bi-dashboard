@@ -160,6 +160,17 @@ async function loadRuntimeConfig() {
   } catch {}
 }
 
+async function pingBackend() {
+  try {
+    await fetch(apiUrl("/health"), { cache: "no-store" })
+  } catch {}
+}
+
+async function loadPlatforms() {
+  const response = await request("/api/platforms")
+  if (response.ok) platformsData.value = await response.json()
+}
+
 function apiUrl(path) {
   return `${apiBase.value}${path}`
 }
@@ -176,7 +187,7 @@ function saveAccessToken() {
   accessToken.value = accessTokenInput.value.trim()
   localStorage.setItem("dashboard_access_token", accessToken.value)
   showAuth.value = false
-  load()
+  loadPlatforms(); load(); loadStatus()
 }
 
 async function load() {
@@ -335,8 +346,13 @@ async function switchPlatform(platform) {
 
 onMounted(async () => {
   await loadRuntimeConfig()
-  request("/api/platforms").then(r => r.ok ? r.json() : null).then(d => { if (d) platformsData.value = d })
-  load(); loadStatus()
+  document.documentElement.dataset.ideadockReady = "true"
+  await pingBackend()
+  if (!accessToken.value) {
+    showAuth.value = true
+    return
+  }
+  loadPlatforms(); load(); loadStatus()
 })
 </script>
 
