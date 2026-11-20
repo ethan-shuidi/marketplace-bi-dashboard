@@ -46,6 +46,9 @@ MARKETS = {
 }
 
 SHOP_TIMEZONE = ZoneInfo("Asia/Singapore")
+# Shopee's order list and ads daily report endpoints reject ranges longer than
+# 15 days ("diff in 15days"); longer dashboard periods must be split.
+SHOPEE_MAX_QUERY_DAYS = 15
 # Business Insights "confirmed orders" excludes unpaid and cancelled orders.
 # Keep the list configurable because Shopee can add an intermediate status.
 CONFIRMED_ORDER_STATUSES = {
@@ -636,6 +639,18 @@ class ShopeeAdapter:
                 if exc.response.status_code in (401, 403):
                     raise HTTPException(424, "Shopee 店铺 Token 与店铺不匹配，请重新连接主账号") from exc
                 raise HTTPException(502, f"Shopee API 请求失败（HTTP {exc.response.status_code}）") from exc
+            except httpx.TransportError as exc:
+                logger.warning(
+                    "Shopee API transport failure: shop_id=%s path=%s attempt=%s error_type=%s",
+                    shop_id,
+                    path,
+                    attempt + 1,
+                    type(exc).__name__,
+                )
+                if attempt < 3:
+                    await asyncio.sleep(min(1.0 * (2 ** attempt), 8.0))
+                    continue
+                raise HTTPException(502, f"Shopee API 请求失败（网络错误：{type(exc).__name__}）") from exc
             except httpx.HTTPError as exc:
                 raise HTTPException(502, f"Shopee API 请求失败（网络错误：{type(exc).__name__}）") from exc
             try:
@@ -703,6 +718,18 @@ class ShopeeAdapter:
                 if exc.response.status_code in (401, 403):
                     raise HTTPException(424, "Shopee 商业分析 API 无权限或授权已失效") from exc
                 raise HTTPException(502, f"Shopee 商业分析 API 请求失败（HTTP {exc.response.status_code}）") from exc
+            except httpx.TransportError as exc:
+                logger.warning(
+                    "Shopee Business Insights transport failure: shop_id=%s path=%s attempt=%s error_type=%s",
+                    shop.get("shop_id"),
+                    path,
+                    attempt + 1,
+                    type(exc).__name__,
+                )
+                if attempt < 3:
+                    await asyncio.sleep(min(1.0 * (2 ** attempt), 8.0))
+                    continue
+                raise HTTPException(502, f"Shopee 商业分析 API 请求失败（网络错误：{type(exc).__name__}）") from exc
             except httpx.HTTPError as exc:
                 raise HTTPException(502, f"Shopee 商业分析 API 请求失败（网络错误：{type(exc).__name__}）") from exc
             try:
@@ -794,6 +821,15 @@ class ShopeeAdapter:
         }
 
     @staticmethod
+    def _date_windows(start_date: date, end_date: date, max_days: int = SHOPEE_MAX_QUERY_DAYS):
+        """Split an inclusive date range into API-safe windows."""
+        cursor = start_date
+        while cursor <= end_date:
+            window_end = min(cursor + timedelta(days=max_days - 1), end_date)
+            yield cursor, window_end
+            cursor = window_end + timedelta(days=1)
+
+    @staticmethod
     def _parse_record_date(value: Any) -> date | None:
         if isinstance(value, (int, float)):
             try:
@@ -810,6 +846,45 @@ class ShopeeAdapter:
                 continue
         return None
 
+    async def _shop_sales_metric_for_day(self, shop: dict[str, Any], current: date) -> dict[str, Any]:
+        response = await self._principal_request(
+            "/api/v2/principal/get_shop_sales_performance_detail",
+            shop,
+            {
+                "start_date": current.isoformat(),
+                "end_date": current.isoformat(),
+                "timezone": "GMT+8",
+                "granularity": "day",
+                "shop_list": [{"shop_id": int(shop["shop_id"]), "currency": "LOCAL"}],
+            },
+        )
+        details = response.get("details") or response.get("shop_sales_performance_detail") or response.get("data") or []
+        summary = response.get("summary") or response.get("shop_sales_performance") or []
+        if isinstance(details, dict):
+            details = details.get("items") or details.get("list") or [details]
+        if isinstance(summary, dict):
+            summary = summary.get("items") or summary.get("list") or [summary]
+        metric = next((item for item in details if str(item.get("shop_id")) == str(shop["shop_id"])), None) or (details[0] if details else None) or (summary[0] if summary else {})
+        if not isinstance(metric, dict):
+            metric = {}
+        sales_value = (
+            metric.get("sales")
+            or metric.get("sales_amount")
+            or metric.get("placed_order_sales")
+            or metric.get("confirmed_order_sales")
+            or metric.get("gmv")
+            or 0
+        )
+        orders_value = metric.get("orders") or metric.get("orders_count") or metric.get("placed_order_count") or metric.get("confirmed_order_count") or 0
+        units_value = metric.get("units_sold") or metric.get("units") or metric.get("items") or metric.get("placed_order_items") or metric.get("confirmed_order_items") or 0
+        return {
+            "date": current.isoformat(),
+            "market": str(shop.get("market") or "--"),
+            "sales": round(float(sales_value), 2),
+            "orders": int(orders_value),
+            "units": int(units_value),
+        }
+
     async def _shop_sales_performance(self, shop: dict[str, Any], start_date: date, end_date: date) -> dict[str, Any] | None:
         """Read Seller Center Business Insights metrics for each historical day.
 
@@ -823,53 +898,18 @@ class ShopeeAdapter:
         analytics_end = min(end_date, latest_analytics_date)
         if analytics_end < start_date:
             return None
-        daily: dict[str, dict[str, Any]] = {}
-        for offset in range((analytics_end - start_date).days + 1):
-            current = start_date + timedelta(days=offset)
-            response = await self._principal_request(
-                "/api/v2/principal/get_shop_sales_performance_detail",
-                shop,
-                {
-                    "start_date": current.isoformat(),
-                    "end_date": current.isoformat(),
-                    "timezone": "GMT+8",
-                    "granularity": "day",
-                    "shop_list": [{"shop_id": int(shop["shop_id"]), "currency": "LOCAL"}],
-                },
-            )
-            details = response.get("details") or response.get("shop_sales_performance_detail") or response.get("data") or []
-            summary = response.get("summary") or response.get("shop_sales_performance") or []
-            if isinstance(details, dict):
-                details = details.get("items") or details.get("list") or [details]
-            if isinstance(summary, dict):
-                summary = summary.get("items") or summary.get("list") or [summary]
-            metric = next((item for item in details if str(item.get("shop_id")) == str(shop["shop_id"])), None) or (details[0] if details else None) or (summary[0] if summary else {})
-            if not isinstance(metric, dict):
-                metric = {}
-            sales_value = (
-                metric.get("sales")
-                or metric.get("sales_amount")
-                or metric.get("placed_order_sales")
-                or metric.get("confirmed_order_sales")
-                or metric.get("gmv")
-                or 0
-            )
-            orders_value = metric.get("orders") or metric.get("orders_count") or metric.get("placed_order_count") or metric.get("confirmed_order_count") or 0
-            units_value = metric.get("units_sold") or metric.get("units") or metric.get("items") or metric.get("placed_order_items") or metric.get("confirmed_order_items") or 0
-            daily[current.isoformat()] = {
-                "date": current.isoformat(),
-                "market": str(shop.get("market") or "--"),
-                "sales": round(float(sales_value), 2),
-                "orders": int(orders_value),
-                "units": int(units_value),
-            }
-        return {"daily": daily, "source": "Shopee Business Insights API v2 (PlacedOrder)"}
+        days = [start_date + timedelta(days=offset) for offset in range((analytics_end - start_date).days + 1)]
+        semaphore = asyncio.Semaphore(4)
+
+        async def load_day(current: date) -> dict[str, Any]:
+            async with semaphore:
+                return await self._shop_sales_metric_for_day(shop, current)
+
+        metrics = await asyncio.gather(*(load_day(current) for current in days))
+        return {"daily": {item["date"]: item for item in metrics}, "source": "Shopee Business Insights API v2 (PlacedOrder)"}
 
     async def _shop_dashboard(self, shop: dict[str, Any], start_date: date, end_date: date) -> dict[str, Any]:
         # Shopee seller analytics displays dates in the shop's GMT+08 timezone.
-        # Convert local calendar boundaries to Unix timestamps for the API.
-        start_ts = int(datetime.combine(start_date, datetime.min.time(), tzinfo=SHOP_TIMEZONE).timestamp())
-        end_ts = int(datetime.combine(end_date, datetime.max.time(), tzinfo=SHOP_TIMEZONE).timestamp())
         market = str(shop.get("market") or "--")
         daily = {
             (start_date + timedelta(days=index)).isoformat(): self._daily_row(start_date + timedelta(days=index), market)
@@ -897,24 +937,27 @@ class ShopeeAdapter:
             # apps that have not been granted the Business Insights permission.
             # Shopee does not support an ``ALL`` value for order_status.
             order_records: list[dict[str, Any]] = []
-            cursor = ""
-            while True:
-                payload = {
-                    "time_range_field": "create_time",
-                    "time_from": start_ts,
-                    "time_to": end_ts,
-                    "page_size": 100,
-                }
-                if cursor:
-                    payload["cursor"] = cursor
-                page = await self._request("/api/v2/order/get_order_list", shop, payload, method="GET")
-                order_records.extend(item for item in (page.get("order_list") or []) if item.get("order_sn"))
-                if not page.get("more"):
-                    break
-                next_cursor = str(page.get("next_cursor") or "")
-                if not next_cursor or next_cursor == cursor:
-                    break
-                cursor = next_cursor
+            for window_start, window_end in self._date_windows(start_date, end_date):
+                window_from = int(datetime.combine(window_start, datetime.min.time(), tzinfo=SHOP_TIMEZONE).timestamp())
+                window_to = int(datetime.combine(window_end, datetime.max.time(), tzinfo=SHOP_TIMEZONE).timestamp())
+                cursor = ""
+                while True:
+                    payload = {
+                        "time_range_field": "create_time",
+                        "time_from": window_from,
+                        "time_to": window_to,
+                        "page_size": 100,
+                    }
+                    if cursor:
+                        payload["cursor"] = cursor
+                    page = await self._request("/api/v2/order/get_order_list", shop, payload, method="GET")
+                    order_records.extend(item for item in (page.get("order_list") or []) if item.get("order_sn"))
+                    if not page.get("more"):
+                        break
+                    next_cursor = str(page.get("next_cursor") or "")
+                    if not next_cursor or next_cursor == cursor:
+                        break
+                    cursor = next_cursor
 
             order_sns = list(dict.fromkeys(item["order_sn"] for item in order_records))
             rows: list[dict[str, Any]] = []
@@ -982,22 +1025,20 @@ class ShopeeAdapter:
             (start_date + timedelta(days=index)).isoformat(): 0.0
             for index in range((end_date - start_date).days + 1)
         }
-        cursor = start_date
         try:
-            while cursor <= end_date:
-                chunk_end = min(cursor + timedelta(days=29), end_date)
-                if cursor == chunk_end:
+            for chunk_start, chunk_end in self._date_windows(start_date, end_date):
+                if chunk_start == chunk_end:
                     response = await self._request(
                         "/api/v2/ads/get_all_cpc_ads_hourly_performance",
                         shop,
-                        {"performance_date": cursor.strftime("%d-%m-%Y")},
+                        {"performance_date": chunk_start.strftime("%d-%m-%Y")},
                         method="GET",
                     )
                 else:
                     response = await self._request(
                         "/api/v2/ads/get_all_cpc_ads_daily_performance",
                         shop,
-                        {"start_date": cursor.strftime("%d-%m-%Y"), "end_date": chunk_end.strftime("%d-%m-%Y")},
+                        {"start_date": chunk_start.strftime("%d-%m-%Y"), "end_date": chunk_end.strftime("%d-%m-%Y")},
                         method="GET",
                     )
                 if isinstance(response, list):
@@ -1007,11 +1048,10 @@ class ShopeeAdapter:
                         record_date = self._parse_record_date(
                             item.get("date") or item.get("performance_date") or item.get("report_date") or item.get("statistic_date")
                         )
-                        if record_date is None and cursor == chunk_end:
-                            record_date = cursor
+                        if record_date is None and chunk_start == chunk_end:
+                            record_date = chunk_start
                         if record_date and record_date.isoformat() in daily:
                             daily[record_date.isoformat()] += float(item.get("expense") or 0)
-                cursor = chunk_end + timedelta(days=1)
         except HTTPException as exc:
             detail = str(exc.detail)
             if "permission" in detail.lower() or "no permission" in detail.lower():

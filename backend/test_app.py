@@ -1,13 +1,13 @@
 import asyncio
 import time
 import unittest
-from datetime import date
+from datetime import date, datetime
 from unittest.mock import AsyncMock, Mock, patch
 
 import httpx
 from fastapi import HTTPException
 
-from app import LazadaAdapter, ShopeeAdapter, TikTokShopAdapter, demo_dashboard
+from app import SHOP_TIMEZONE, LazadaAdapter, ShopeeAdapter, TikTokShopAdapter, demo_dashboard
 
 
 class LazadaAdapterContractTest(unittest.IsolatedAsyncioTestCase):
@@ -217,6 +217,59 @@ class ShopeeDashboardAggregationTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["sales"], 469.0)
         self.assertEqual(result["orders"], 1)
         self.assertEqual(result["units"], 1)
+
+    def test_date_windows_split_long_ranges(self):
+        self.assertEqual(
+            list(self.adapter._date_windows(date(2026, 11, 1), date(2026, 11, 18))),
+            [(date(2026, 11, 1), date(2026, 11, 15)), (date(2026, 11, 16), date(2026, 11, 18))],
+        )
+        self.assertEqual(
+            list(self.adapter._date_windows(date(2026, 11, 1), date(2026, 11, 1))),
+            [(date(2026, 11, 1), date(2026, 11, 1))],
+        )
+
+    async def test_shop_ad_spend_chunks_ranges_over_15_days(self):
+        self.adapter._request = AsyncMock(side_effect=[
+            [{"date": "01-11-2026", "expense": 10.0}],
+            [{"date": "16-11-2026", "expense": 5.0}],
+        ])
+
+        total, status, daily = await self.adapter._shop_ad_spend(
+            {"shop_id": "1", "access_token": "token"},
+            date(2026, 11, 1),
+            date(2026, 11, 18),
+        )
+
+        self.assertEqual(total, 15.0)
+        self.assertEqual(status, "ready")
+        self.assertEqual(daily["2026-11-01"], 10.0)
+        self.assertEqual(daily["2026-11-16"], 5.0)
+        calls = self.adapter._request.await_args_list
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(calls[0].args[2]["start_date"], "01-11-2026")
+        self.assertEqual(calls[0].args[2]["end_date"], "15-11-2026")
+        self.assertEqual(calls[1].args[2]["start_date"], "16-11-2026")
+        self.assertEqual(calls[1].args[2]["end_date"], "18-11-2026")
+
+    async def test_order_fallback_chunks_ranges_over_15_days(self):
+        self.adapter._shop_sales_performance = AsyncMock(return_value=None)
+        self.adapter._shop_ad_spend = AsyncMock(return_value=(0.0, "ready", {}))
+        self.adapter._request = AsyncMock(side_effect=[{"order_list": []}, {"order_list": []}])
+
+        result = await self.adapter._shop_dashboard(
+            {"shop_id": "1", "market": "MY", "currency": "MYR"},
+            date(2026, 11, 1),
+            date(2026, 11, 18),
+        )
+
+        self.assertEqual(result["orders"], 0)
+        calls = self.adapter._request.await_args_list
+        self.assertEqual(len(calls), 2)
+        first, second = calls[0].args[2], calls[1].args[2]
+        self.assertEqual(first["time_from"], int(datetime(2026, 11, 1, tzinfo=SHOP_TIMEZONE).timestamp()))
+        self.assertEqual(first["time_to"], int(datetime(2026, 11, 15, 23, 59, 59, 999999, tzinfo=SHOP_TIMEZONE).timestamp()))
+        self.assertEqual(second["time_from"], int(datetime(2026, 11, 16, tzinfo=SHOP_TIMEZONE).timestamp()))
+        self.assertEqual(second["time_to"], int(datetime(2026, 11, 18, 23, 59, 59, 999999, tzinfo=SHOP_TIMEZONE).timestamp()))
 
     def test_same_market_shops_are_merged(self):
         shops = [{"market": "MY"}, {"market": "MY"}]
